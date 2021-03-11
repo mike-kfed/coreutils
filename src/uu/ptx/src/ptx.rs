@@ -71,6 +71,14 @@ fn read_word_filter_file(matches: &Matches, option: &str) -> HashSet<String> {
     words
 }
 
+fn read_char_filter_file(matches: &Matches, option: &str) -> HashSet<char> {
+    let filename = matches.opt_str(option).expect("parsing options failed!");
+    let mut reader = crash_if_err!(1, File::open(filename));
+    let mut buffer = String::new();
+    crash_if_err!(1, reader.read_to_string(&mut buffer));
+    buffer.chars().collect()
+}
+
 #[derive(Debug)]
 struct WordFilter {
     only_specified: bool,
@@ -92,9 +100,24 @@ impl WordFilter {
         } else {
             (false, HashSet::new())
         };
-        if matches.opt_present("b") {
-            crash!(1, "-b not implemented yet");
-        }
+        // TODO
+        let break_set: Option<HashSet<char>> =
+            if matches.opt_present("b") && !matches.opt_present("W") {
+                //crash!(1, "-b not implemented yet");
+                let chars = read_char_filter_file(matches, "b");
+                let mut hs: HashSet<char> = if config.gnu_ext {
+                    HashSet::new() // really only chars found in file
+                } else {
+                    // GNU off means at least these are considered
+                    [' ', '\t', '\n'].iter().cloned().collect()
+                };
+                hs.extend(chars);
+                Some(hs)
+            } else {
+                //[' ', '\t', '\n'].iter().cloned().collect()
+                // if -W takes precedence or default
+                None
+            };
         // Ignore empty string regex from cmd-line-args
         let arg_reg: Option<String> = if matches.opt_present("W") {
             matches.opt_str("W").filter(|reg| !reg.is_empty())
@@ -104,13 +127,24 @@ impl WordFilter {
         let reg = match arg_reg {
             Some(arg_reg) => arg_reg,
             None => {
-                if config.gnu_ext {
+                if break_set.is_some() {
+                    format!(
+                        "[^{}]+",
+                        break_set
+                            .unwrap()
+                            .into_iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<String>>()
+                            .join("")
+                    )
+                } else if config.gnu_ext {
                     "\\w+".to_owned()
                 } else {
                     "[^ \t\n]+".to_owned()
                 }
             }
         };
+        dbg!(&reg);
         WordFilter {
             only_specified: o,
             ignore_specified: i,
