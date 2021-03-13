@@ -103,7 +103,6 @@ impl WordFilter {
         // TODO
         let break_set: Option<HashSet<char>> =
             if matches.opt_present("b") && !matches.opt_present("W") {
-                //crash!(1, "-b not implemented yet");
                 let chars = read_char_filter_file(matches, "b");
                 let mut hs: HashSet<char> = if config.gnu_ext {
                     HashSet::new() // really only chars found in file
@@ -114,7 +113,6 @@ impl WordFilter {
                 hs.extend(chars);
                 Some(hs)
             } else {
-                //[' ', '\t', '\n'].iter().cloned().collect()
                 // if -W takes precedence or default
                 None
             };
@@ -144,7 +142,7 @@ impl WordFilter {
                 }
             }
         };
-        dbg!(&reg);
+        //dbg!(&reg);
         WordFilter {
             only_specified: o,
             ignore_specified: i,
