@@ -124,7 +124,6 @@ impl WordFilter {
         } else {
             (false, HashSet::new())
         };
-        // TODO
         let break_set: Option<HashSet<char>> = if matches.is_present(options::BREAK_FILE)
             && !matches.is_present(options::WORD_REGEXP)
         {
