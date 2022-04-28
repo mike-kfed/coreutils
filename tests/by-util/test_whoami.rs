@@ -1,50 +1,45 @@
+//  * This file is part of the uutils coreutils package.
+//  *
+//  * For the full copyright and license information, please view the LICENSE
+//  * file that was distributed with this source code.
+
 use crate::common::util::*;
-use std::env;
 
 #[test]
+#[cfg(unix)]
 fn test_normal() {
-    let (_, mut ucmd) = at_and_ucmd!();
+    let ts = TestScenario::new(util_name!());
+    let result = ts.ucmd().run();
+    let exp_result = unwrap_or_return!(expected_result(&ts, &[]));
 
-    let result = ucmd.run();
-    println!("result.stdout = {}", result.stdout);
-    println!("result.stderr = {}", result.stderr);
-    println!("env::var(CI).is_ok() = {}", env::var("CI").is_ok());
-
-    for (key, value) in env::vars() {
-        println!("{}: {}", key, value);
-    }
-    if is_ci() && result.stderr.contains("failed to get username") {
-        // In the CI, some server are failing to return whoami.
-        // As seems to be a configuration issue, ignoring it
-        return;
-    }
-
-    assert!(result.success);
-    assert!(!result.stdout.trim().is_empty());
+    result
+        .stdout_is(exp_result.stdout_str())
+        .stderr_is(exp_result.stderr_str())
+        .code_is(exp_result.code());
 }
 
 #[test]
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn test_normal_compare_id() {
-    let (_, mut ucmd) = at_and_ucmd!();
-
-    let result = ucmd.run();
-
-    println!("result.stdout = {}", result.stdout);
-    println!("result.stderr = {}", result.stderr);
-    if is_ci() && result.stderr.contains("failed to get username") {
-        // In the CI, some server are failing to return whoami.
-        // As seems to be a configuration issue, ignoring it
-        return;
-    }
-    assert!(result.success);
     let ts = TestScenario::new("id");
-    let id = ts.cmd("id").arg("-un").run();
-
-    if is_ci() && id.stderr.contains("cannot find name for user ID") {
-        // In the CI, some server are failing to return whoami.
-        // As seems to be a configuration issue, ignoring it
-        return;
+    let id_un = unwrap_or_return!(expected_result(&ts, &["-un"]));
+    if id_un.succeeded() {
+        new_ucmd!().succeeds().stdout_is(id_un.stdout_str());
+    } else if is_ci() && id_un.stderr_str().contains("cannot find name for user ID") {
+        println!("test skipped:");
+    } else {
+        id_un.success();
     }
-    assert_eq!(result.stdout.trim(), id.stdout.trim());
+}
+
+#[test]
+fn test_normal_compare_env() {
+    let whoami = whoami();
+    if whoami == "nobody" {
+        println!("test skipped:");
+    } else if !is_ci() {
+        new_ucmd!().succeeds().stdout_is(format!("{}\n", whoami));
+    } else {
+        println!("test skipped:");
+    }
 }

@@ -8,81 +8,100 @@
 #[macro_use]
 extern crate uucore;
 
+use clap::{crate_version, Arg, Command};
 use libc::mkfifo;
 use std::ffi::CString;
-use std::io::Error;
+use uucore::error::{UResult, USimpleError};
+use uucore::format_usage;
+use uucore::{display::Quotable, InvalidEncodingHandling};
 
 static NAME: &str = "mkfifo";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+static USAGE: &str = "{} [OPTION]... NAME...";
+static SUMMARY: &str = "Create a FIFO with the given name.";
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+mod options {
+    pub static MODE: &str = "mode";
+    pub static SE_LINUX_SECURITY_CONTEXT: &str = "Z";
+    pub static CONTEXT: &str = "context";
+    pub static FIFO: &str = "fifo";
+}
 
-    let mut opts = getopts::Options::new();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::Ignore)
+        .accept_any();
 
-    opts.optopt(
-        "m",
-        "mode",
-        "file permissions for the fifo",
-        "(default 0666)",
-    );
-    opts.optflag("h", "help", "display this help and exit");
-    opts.optflag("V", "version", "output version information and exit");
+    let matches = uu_app().get_matches_from(args);
 
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(err) => panic!("{}", err),
-    };
-
-    if matches.opt_present("version") {
-        println!("{} {}", NAME, VERSION);
-        return 0;
+    if matches.is_present(options::CONTEXT) {
+        return Err(USimpleError::new(1, "--context is not implemented"));
+    }
+    if matches.is_present(options::SE_LINUX_SECURITY_CONTEXT) {
+        return Err(USimpleError::new(1, "-Z is not implemented"));
     }
 
-    if matches.opt_present("help") || matches.free.is_empty() {
-        let msg = format!(
-            "{0} {1}
-
-Usage:
-  {0} [OPTIONS] NAME...
-
-Create a FIFO with the given name.",
-            NAME, VERSION
-        );
-
-        print!("{}", opts.usage(&msg));
-        if matches.free.is_empty() {
-            return 1;
-        }
-        return 0;
-    }
-
-    let mode = match matches.opt_str("m") {
-        Some(m) => match usize::from_str_radix(&m, 8) {
+    let mode = match matches.value_of(options::MODE) {
+        Some(m) => match usize::from_str_radix(m, 8) {
             Ok(m) => m,
-            Err(e) => {
-                show_error!("invalid mode: {}", e);
-                return 1;
-            }
+            Err(e) => return Err(USimpleError::new(1, format!("invalid mode: {}", e))),
         },
         None => 0o666,
     };
 
-    let mut exit_status = 0;
-    for f in &matches.free {
+    let fifos: Vec<String> = match matches.values_of(options::FIFO) {
+        Some(v) => v.clone().map(|s| s.to_owned()).collect(),
+        None => return Err(USimpleError::new(1, "missing operand")),
+    };
+
+    for f in fifos {
         let err = unsafe {
             let name = CString::new(f.as_bytes()).unwrap();
             mkfifo(name.as_ptr(), mode as libc::mode_t)
         };
         if err == -1 {
-            show_error!(
-                "creating '{}': {}",
-                f,
-                Error::last_os_error().raw_os_error().unwrap()
-            );
-            exit_status = 1;
+            show!(USimpleError::new(
+                1,
+                format!("cannot create fifo {}: File exists", f.quote())
+            ));
         }
     }
 
-    exit_status
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .name(NAME)
+        .version(crate_version!())
+        .override_usage(format_usage(USAGE))
+        .about(SUMMARY)
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::MODE)
+                .short('m')
+                .long(options::MODE)
+                .help("file permissions for the fifo")
+                .default_value("0666")
+                .value_name("0666"),
+        )
+        .arg(
+            Arg::new(options::SE_LINUX_SECURITY_CONTEXT)
+                .short('Z')
+                .help("set the SELinux security context to default type"),
+        )
+        .arg(
+            Arg::new(options::CONTEXT)
+                .long(options::CONTEXT)
+                .value_name("CTX")
+                .help(
+                    "like -Z, or if CTX is specified then set the SELinux \
+                    or SMACK security context to CTX",
+                ),
+        )
+        .arg(
+            Arg::new(options::FIFO)
+                .hide(true)
+                .multiple_occurrences(true),
+        )
 }

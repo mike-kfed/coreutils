@@ -6,19 +6,27 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-// spell-checker:ignore (format) MMDDhhmm
-// spell-checker:ignore (ToDO) DATEFILE
+// spell-checker:ignore (chrono) Datelike Timelike ; (format) DATEFILE MMDDhhmm ; (vars) datetime datetimes
 
-#[macro_use]
-extern crate uucore;
-
-use clap::{App, Arg};
-
-use chrono::offset::Utc;
-use chrono::{DateTime, FixedOffset, Local, Offset};
+use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
+#[cfg(windows)]
+use chrono::{Datelike, Timelike};
+use clap::{crate_version, Arg, Command};
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "redox")))]
+use libc::{clock_settime, timespec, CLOCK_REALTIME};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use uucore::display::Quotable;
+#[cfg(not(any(target_os = "macos", target_os = "redox")))]
+use uucore::error::FromIo;
+use uucore::error::{UResult, USimpleError};
+use uucore::{format_usage, show_error};
+#[cfg(windows)]
+use winapi::{
+    shared::minwindef::WORD,
+    um::{minwinbase::SYSTEMTIME, sysinfoapi::SetSystemTime},
+};
 
 // Options
 const DATE: &str = "date";
@@ -30,9 +38,10 @@ const MINUTE: &str = "minute";
 const SECOND: &str = "second";
 const NS: &str = "ns";
 
-const NAME: &str = "date";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ABOUT: &str = "print or set the system date and time";
+const USAGE: &str = "\
+    {} [OPTION]... [+FORMAT]...
+    {} [OPTION]... [MMDDhhmm[[CC]YY][.ss]]";
 
 const OPT_DATE: &str = "date";
 const OPT_FORMAT: &str = "format";
@@ -61,6 +70,13 @@ static RFC_3339_HELP_STRING: &str = "output date/time in RFC 3339 format.
  FMT='date', 'seconds', or 'ns'
  for date and time to the indicated precision.
  Example: 2006-08-14 02:34:56-06:00";
+
+#[cfg(not(any(target_os = "macos", target_os = "redox")))]
+static OPT_SET_HELP_STRING: &str = "set time described by STRING";
+#[cfg(target_os = "macos")]
+static OPT_SET_HELP_STRING: &str = "set time described by STRING (not available on mac yet)";
+#[cfg(target_os = "redox")]
+static OPT_SET_HELP_STRING: &str = "set time described by STRING (not available on redox yet)";
 
 /// Settings for this program, parsed from the command line
 struct Settings {
@@ -97,11 +113,11 @@ enum Iso8601Format {
 impl<'a> From<&'a str> for Iso8601Format {
     fn from(s: &str) -> Self {
         match s {
-            HOURS | HOUR => Iso8601Format::Hours,
-            MINUTES | MINUTE => Iso8601Format::Minutes,
-            SECONDS | SECOND => Iso8601Format::Seconds,
-            NS => Iso8601Format::Ns,
-            DATE => Iso8601Format::Date,
+            HOURS | HOUR => Self::Hours,
+            MINUTES | MINUTE => Self::Minutes,
+            SECONDS | SECOND => Self::Seconds,
+            NS => Self::Ns,
+            DATE => Self::Date,
             // Should be caught by clap
             _ => panic!("Invalid format: {}", s),
         }
@@ -117,89 +133,27 @@ enum Rfc3339Format {
 impl<'a> From<&'a str> for Rfc3339Format {
     fn from(s: &str) -> Self {
         match s {
-            DATE => Rfc3339Format::Date,
-            SECONDS | SECOND => Rfc3339Format::Seconds,
-            NS => Rfc3339Format::Ns,
+            DATE => Self::Date,
+            SECONDS | SECOND => Self::Seconds,
+            NS => Self::Ns,
             // Should be caught by clap
             _ => panic!("Invalid format: {}", s),
         }
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let syntax = format!(
-        "{0} [OPTION]... [+FORMAT]...
- {0} [OPTION]... [MMDDhhmm[[CC]YY][.ss]]",
-        NAME
-    );
-    let matches = App::new(executable!())
-        .version(VERSION)
-        .about(ABOUT)
-        .usage(&syntax[..])
-        .arg(
-            Arg::with_name(OPT_DATE)
-                .short("d")
-                .long(OPT_DATE)
-                .takes_value(true)
-                .help("display time described by STRING, not 'now'"),
-        )
-        .arg(
-            Arg::with_name(OPT_FILE)
-                .short("f")
-                .long(OPT_FILE)
-                .takes_value(true)
-                .help("like --date; once for each line of DATEFILE"),
-        )
-        .arg(
-            Arg::with_name(OPT_ISO_8601)
-                .short("I")
-                .long(OPT_ISO_8601)
-                .takes_value(true)
-                .help(ISO_8601_HELP_STRING),
-        )
-        .arg(
-            Arg::with_name(OPT_RFC_EMAIL)
-                .short("R")
-                .long(OPT_RFC_EMAIL)
-                .help(RFC_5322_HELP_STRING),
-        )
-        .arg(
-            Arg::with_name(OPT_RFC_3339)
-                .long(OPT_RFC_3339)
-                .takes_value(true)
-                .help(RFC_3339_HELP_STRING),
-        )
-        .arg(
-            Arg::with_name(OPT_DEBUG)
-                .long(OPT_DEBUG)
-                .help("annotate the parsed date, and warn about questionable usage to stderr"),
-        )
-        .arg(
-            Arg::with_name(OPT_REFERENCE)
-                .short("r")
-                .long(OPT_REFERENCE)
-                .takes_value(true)
-                .help("display the last modification time of FILE"),
-        )
-        .arg(
-            Arg::with_name(OPT_SET)
-                .short("s")
-                .long(OPT_SET)
-                .takes_value(true)
-                .help("set time described by STRING"),
-        )
-        .arg(
-            Arg::with_name(OPT_UNIVERSAL)
-                .short("u")
-                .long(OPT_UNIVERSAL)
-                .alias(OPT_UNIVERSAL_2)
-                .help("print or set Coordinated Universal Time (UTC)"),
-        )
-        .arg(Arg::with_name(OPT_FORMAT).multiple(true))
-        .get_matches_from(args);
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uu_app().get_matches_from(args);
 
     let format = if let Some(form) = matches.value_of(OPT_FORMAT) {
-        let form = form[1..].into();
+        if !form.starts_with('+') {
+            return Err(USimpleError::new(
+                1,
+                format!("invalid date {}", form.quote()),
+            ));
+        }
+        let form = form[1..].to_string();
         Format::Custom(form)
     } else if let Some(fmt) = matches
         .values_of(OPT_ISO_8601)
@@ -222,18 +176,33 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         DateSource::Now
     };
 
+    let set_to = match matches.value_of(OPT_SET).map(parse_date) {
+        None => None,
+        Some(Err((input, _err))) => {
+            return Err(USimpleError::new(
+                1,
+                format!("invalid date {}", input.quote()),
+            ));
+        }
+        Some(Ok(date)) => Some(date),
+    };
+
     let settings = Settings {
         utc: matches.is_present(OPT_UNIVERSAL),
         format,
         date_source,
-        // TODO: Handle this option:
-        set_to: None,
+        set_to,
     };
 
-    if let Some(_time) = settings.set_to {
-        unimplemented!();
-    // Probably need to use this syscall:
-    // https://doc.rust-lang.org/libc/i686-unknown-linux-gnu/libc/fn.clock_settime.html
+    if let Some(date) = settings.set_to {
+        // All set time functions expect UTC datetimes.
+        let date: DateTime<Utc> = if settings.utc {
+            date.with_timezone(&Utc)
+        } else {
+            date.into()
+        };
+
+        return set_system_datetime(date);
     } else {
         // Declare a file here because it needs to outlive the `dates` iterator.
         let file: File;
@@ -246,15 +215,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             let now = Local::now();
             now.with_timezone(now.offset())
         };
-
-        /// Parse a `String` into a `DateTime`.
-        /// If it fails, return a tuple of the `String` along with its `ParseError`.
-        fn parse_date(
-            s: String,
-        ) -> Result<DateTime<FixedOffset>, (String, chrono::format::ParseError)> {
-            // TODO: The GNU date command can parse a wide variety of inputs.
-            s.parse().map_err(|e| (s, e))
-        }
 
         // Iterate over all dates - whether it's a single date or a file.
         let dates: Box<dyn Iterator<Item = _>> = match settings.date_source {
@@ -281,17 +241,85 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         for date in dates {
             match date {
                 Ok(date) => {
-                    let formatted = date.format(format_string);
+                    // GNU `date` uses `%N` for nano seconds, however crate::chrono uses `%f`
+                    let format_string = &format_string.replace("%N", "%f");
+                    let formatted = date.format(format_string).to_string().replace("%f", "%N");
                     println!("{}", formatted);
                 }
-                Err((input, _err)) => {
-                    println!("date: invalid date '{}'", input);
-                }
+                Err((input, _err)) => show_error!("invalid date {}", input.quote()),
             }
         }
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(OPT_DATE)
+                .short('d')
+                .long(OPT_DATE)
+                .takes_value(true)
+                .help("display time described by STRING, not 'now'"),
+        )
+        .arg(
+            Arg::new(OPT_FILE)
+                .short('f')
+                .long(OPT_FILE)
+                .takes_value(true)
+                .help("like --date; once for each line of DATEFILE"),
+        )
+        .arg(
+            Arg::new(OPT_ISO_8601)
+                .short('I')
+                .long(OPT_ISO_8601)
+                .takes_value(true)
+                .help(ISO_8601_HELP_STRING),
+        )
+        .arg(
+            Arg::new(OPT_RFC_EMAIL)
+                .short('R')
+                .long(OPT_RFC_EMAIL)
+                .help(RFC_5322_HELP_STRING),
+        )
+        .arg(
+            Arg::new(OPT_RFC_3339)
+                .long(OPT_RFC_3339)
+                .takes_value(true)
+                .help(RFC_3339_HELP_STRING),
+        )
+        .arg(
+            Arg::new(OPT_DEBUG)
+                .long(OPT_DEBUG)
+                .help("annotate the parsed date, and warn about questionable usage to stderr"),
+        )
+        .arg(
+            Arg::new(OPT_REFERENCE)
+                .short('r')
+                .long(OPT_REFERENCE)
+                .takes_value(true)
+                .help("display the last modification time of FILE"),
+        )
+        .arg(
+            Arg::new(OPT_SET)
+                .short('s')
+                .long(OPT_SET)
+                .takes_value(true)
+                .help(OPT_SET_HELP_STRING),
+        )
+        .arg(
+            Arg::new(OPT_UNIVERSAL)
+                .short('u')
+                .long(OPT_UNIVERSAL)
+                .alias(OPT_UNIVERSAL_2)
+                .help("print or set Coordinated Universal Time (UTC)"),
+        )
+        .arg(Arg::new(OPT_FORMAT).multiple_occurrences(false))
 }
 
 /// Return the appropriate format string for the given settings.
@@ -312,5 +340,84 @@ fn make_format_string(settings: &Settings) -> &str {
         },
         Format::Custom(ref fmt) => fmt,
         Format::Default => "%c",
+    }
+}
+
+/// Parse a `String` into a `DateTime`.
+/// If it fails, return a tuple of the `String` along with its `ParseError`.
+fn parse_date<S: AsRef<str> + Clone>(
+    s: S,
+) -> Result<DateTime<FixedOffset>, (String, chrono::format::ParseError)> {
+    // TODO: The GNU date command can parse a wide variety of inputs.
+    s.as_ref().parse().map_err(|e| (s.as_ref().into(), e))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_system_datetime(_date: DateTime<Utc>) -> UResult<()> {
+    unimplemented!("setting date not implemented (unsupported target)");
+}
+
+#[cfg(target_os = "macos")]
+fn set_system_datetime(_date: DateTime<Utc>) -> UResult<()> {
+    Err(USimpleError::new(
+        1,
+        "setting the date is not supported by macOS".to_string(),
+    ))
+}
+
+#[cfg(target_os = "redox")]
+fn set_system_datetime(_date: DateTime<Utc>) -> UResult<()> {
+    Err(USimpleError::new(
+        1,
+        "setting the date is not supported by Redox".to_string(),
+    ))
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "redox")))]
+/// System call to set date (unix).
+/// See here for more:
+/// `<https://doc.rust-lang.org/libc/i686-unknown-linux-gnu/libc/fn.clock_settime.html>`
+/// `<https://linux.die.net/man/3/clock_settime>`
+/// `<https://www.gnu.org/software/libc/manual/html_node/Time-Types.html>`
+fn set_system_datetime(date: DateTime<Utc>) -> UResult<()> {
+    let timespec = timespec {
+        tv_sec: date.timestamp() as _,
+        tv_nsec: date.timestamp_subsec_nanos() as _,
+    };
+
+    let result = unsafe { clock_settime(CLOCK_REALTIME, &timespec) };
+
+    if result != 0 {
+        Err(std::io::Error::last_os_error().map_err_context(|| "cannot set date".to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+/// System call to set date (Windows).
+/// See here for more:
+/// https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-setsystemtime
+/// https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-systemtime
+fn set_system_datetime(date: DateTime<Utc>) -> UResult<()> {
+    let system_time = SYSTEMTIME {
+        wYear: date.year() as WORD,
+        wMonth: date.month() as WORD,
+        // Ignored
+        wDayOfWeek: 0,
+        wDay: date.day() as WORD,
+        wHour: date.hour() as WORD,
+        wMinute: date.minute() as WORD,
+        wSecond: date.second() as WORD,
+        // TODO: be careful of leap seconds - valid range is [0, 999] - how to handle?
+        wMilliseconds: ((date.nanosecond() / 1_000_000) % 1000) as WORD,
+    };
+
+    let result = unsafe { SetSystemTime(&system_time) };
+
+    if result == 0 {
+        Err(std::io::Error::last_os_error().map_err_context(|| "cannot set date".to_string()))
+    } else {
+        Ok(())
     }
 }

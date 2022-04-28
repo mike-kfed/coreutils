@@ -7,37 +7,28 @@
 
 /* last synced with: yes (GNU coreutils) 8.13 */
 
-#[macro_use]
-extern crate clap;
-#[macro_use]
-extern crate uucore;
-
-use clap::Arg;
 use std::borrow::Cow;
 use std::io::{self, Write};
-use uucore::zero_copy::ZeroCopyWriter;
+
+#[macro_use]
+extern crate clap;
+
+use clap::{Arg, Command};
+use uucore::error::{UResult, USimpleError};
+use uucore::format_usage;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod splice;
+
+const USAGE: &str = "{} [STRING]...";
 
 // it's possible that using a smaller or larger buffer might provide better performance on some
 // systems, but honestly this is good enough
 const BUF_SIZE: usize = 16 * 1024;
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let app = app_from_crate!().arg(Arg::with_name("STRING").index(1).multiple(true));
-
-    let matches = match app.get_matches_from_safe(args) {
-        Ok(m) => m,
-        Err(ref e)
-            if e.kind == clap::ErrorKind::HelpDisplayed
-                || e.kind == clap::ErrorKind::VersionDisplayed =>
-        {
-            println!("{}", e);
-            return 0;
-        }
-        Err(f) => {
-            show_error!("{}", f);
-            return 1;
-        }
-    };
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uu_app().get_matches_from(args);
 
     let string = if let Some(values) = matches.values_of("STRING") {
         let mut result = values.fold(String::new(), |res, s| res + s + " ");
@@ -51,12 +42,20 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let mut buffer = [0; BUF_SIZE];
     let bytes = prepare_buffer(&string, &mut buffer);
 
-    exec(bytes);
-
-    0
+    match exec(bytes) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(USimpleError::new(1, format!("standard output: {}", err))),
+    }
 }
 
-#[cfg(not(feature = "latency"))]
+pub fn uu_app<'a>() -> Command<'a> {
+    command!()
+        .override_usage(format_usage(USAGE))
+        .arg(Arg::new("STRING").index(1).multiple_occurrences(true))
+        .infer_long_args(true)
+}
+
 fn prepare_buffer<'a>(input: &'a str, buffer: &'a mut [u8; BUF_SIZE]) -> &'a [u8] {
     if input.len() < BUF_SIZE / 2 {
         let mut size = 0;
@@ -71,16 +70,20 @@ fn prepare_buffer<'a>(input: &'a str, buffer: &'a mut [u8; BUF_SIZE]) -> &'a [u8
     }
 }
 
-#[cfg(feature = "latency")]
-fn prepare_buffer<'a>(input: &'a str, _buffer: &'a mut [u8; BUF_SIZE]) -> &'a [u8] {
-    input.as_bytes()
-}
+pub fn exec(bytes: &[u8]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
 
-pub fn exec(bytes: &[u8]) {
-    let mut stdout_raw = io::stdout();
-    let mut writer = ZeroCopyWriter::with_default(&mut stdout_raw, |stdout| stdout.lock());
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        match splice::splice_data(bytes, &stdout) {
+            Ok(_) => return Ok(()),
+            Err(splice::Error::Io(err)) => return Err(err),
+            Err(splice::Error::Unsupported) => (),
+        }
+    }
+
     loop {
-        // TODO: needs to check if pipe fails
-        writer.write_all(bytes).unwrap();
+        stdout.write_all(bytes)?;
     }
 }

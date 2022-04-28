@@ -7,24 +7,31 @@
 
 // spell-checker:ignore (ToDO) gethostid
 
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, Command};
 use libc::c_long;
+use uucore::{error::UResult, format_usage};
 
-static SYNTAX: &str = "[options]";
-static SUMMARY: &str = "";
-static LONG_HELP: &str = "";
+const USAGE: &str = "{} [options]";
+const SUMMARY: &str = "Print the numeric identifier (in hexadecimal) for the current host";
 
 // currently rust libc interface doesn't include gethostid
 extern "C" {
     pub fn gethostid() -> c_long;
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    app!(SYNTAX, SUMMARY, LONG_HELP).parse(args.collect_str());
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    uu_app().get_matches_from(args);
     hostid();
-    0
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(SUMMARY)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
 }
 
 fn hostid() {

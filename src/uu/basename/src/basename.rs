@@ -7,118 +7,140 @@
 
 // spell-checker:ignore (ToDO) fullname
 
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, Arg, Command};
 use std::path::{is_separator, PathBuf};
+use uucore::display::Quotable;
+use uucore::error::{UResult, UUsageError};
+use uucore::{format_usage, InvalidEncodingHandling};
 
-static NAME: &str = "basename";
-static SYNTAX: &str = "NAME [SUFFIX]";
 static SUMMARY: &str = "Print NAME with any leading directory components removed
- If specified, also remove a trailing SUFFIX";
-static LONG_HELP: &str = "";
+If specified, also remove a trailing SUFFIX";
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+const USAGE: &str = "{} NAME [SUFFIX]
+    {} OPTION... NAME...";
 
+pub mod options {
+    pub static MULTIPLE: &str = "multiple";
+    pub static NAME: &str = "name";
+    pub static SUFFIX: &str = "suffix";
+    pub static ZERO: &str = "zero";
+}
+
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
     //
     // Argument parsing
     //
-    let matches = app!(SYNTAX, SUMMARY, LONG_HELP)
-        .optflag(
-            "a",
-            "multiple",
-            "Support more than one argument. Treat every argument as a name.",
-        )
-        .optopt(
-            "s",
-            "suffix",
-            "Remove a trailing suffix. This option implies the -a option.",
-            "SUFFIX",
-        )
-        .optflag(
-            "z",
-            "zero",
-            "Output a zero byte (ASCII NUL) at the end of each line, rather than a newline.",
-        )
-        .parse(args);
+    let matches = uu_app().get_matches_from(args);
 
     // too few arguments
-    if matches.free.is_empty() {
-        crash!(
-            1,
-            "{0}: {1}\nTry '{0} --help' for more information.",
-            NAME,
-            "missing operand"
-        );
-    }
-    let opt_s = matches.opt_present("s");
-    let opt_a = matches.opt_present("a");
-    let opt_z = matches.opt_present("z");
-    let multiple_paths = opt_s || opt_a;
-    // too many arguments
-    if !multiple_paths && matches.free.len() > 2 {
-        crash!(
-            1,
-            "{0}: extra operand '{1}'\nTry '{0} --help' for more information.",
-            NAME,
-            matches.free[2]
-        );
+    if !matches.is_present(options::NAME) {
+        return Err(UUsageError::new(1, "missing operand".to_string()));
     }
 
-    let suffix = if opt_s {
-        matches.opt_str("s").unwrap()
-    } else if !opt_a && matches.free.len() > 1 {
-        matches.free[1].clone()
+    let opt_suffix = matches.is_present(options::SUFFIX);
+    let opt_multiple = matches.is_present(options::MULTIPLE);
+    let opt_zero = matches.is_present(options::ZERO);
+    let multiple_paths = opt_suffix || opt_multiple;
+    // too many arguments
+    if !multiple_paths && matches.occurrences_of(options::NAME) > 2 {
+        return Err(UUsageError::new(
+            1,
+            format!(
+                "extra operand {}",
+                matches
+                    .values_of(options::NAME)
+                    .unwrap()
+                    .nth(2)
+                    .unwrap()
+                    .quote()
+            ),
+        ));
+    }
+
+    let suffix = if opt_suffix {
+        matches.value_of(options::SUFFIX).unwrap()
+    } else if !opt_multiple && matches.occurrences_of(options::NAME) > 1 {
+        matches.values_of(options::NAME).unwrap().nth(1).unwrap()
     } else {
-        "".to_owned()
+        ""
     };
 
     //
     // Main Program Processing
     //
 
-    let paths = if multiple_paths {
-        &matches.free[..]
+    let paths: Vec<_> = if multiple_paths {
+        matches.values_of(options::NAME).unwrap().collect()
     } else {
-        &matches.free[0..1]
+        matches.values_of(options::NAME).unwrap().take(1).collect()
     };
 
-    let line_ending = if opt_z { "\0" } else { "\n" };
+    let line_ending = if opt_zero { "\0" } else { "\n" };
     for path in paths {
-        print!("{}{}", basename(&path, &suffix), line_ending);
+        print!("{}{}", basename(path, suffix), line_ending);
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(SUMMARY)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::MULTIPLE)
+                .short('a')
+                .long(options::MULTIPLE)
+                .help("support multiple arguments and treat each as a NAME"),
+        )
+        .arg(
+            Arg::new(options::NAME)
+                .multiple_occurrences(true)
+                .hide(true),
+        )
+        .arg(
+            Arg::new(options::SUFFIX)
+                .short('s')
+                .long(options::SUFFIX)
+                .value_name("SUFFIX")
+                .help("remove a trailing SUFFIX; implies -a"),
+        )
+        .arg(
+            Arg::new(options::ZERO)
+                .short('z')
+                .long(options::ZERO)
+                .help("end each output line with NUL, not newline"),
+        )
 }
 
 fn basename(fullname: &str, suffix: &str) -> String {
-    // Remove all platform-specific path separators from the end
-    let mut path: String = fullname
-        .chars()
-        .rev()
-        .skip_while(|&ch| is_separator(ch))
-        .collect();
+    // Remove all platform-specific path separators from the end.
+    let path = fullname.trim_end_matches(is_separator);
 
-    // Undo reverse
-    path = path.chars().rev().collect();
+    // If the path contained *only* suffix characters (for example, if
+    // `fullname` were "///" and `suffix` were "/"), then `path` would
+    // be left with the empty string. In that case, we set `path` to be
+    // the original `fullname` to avoid returning the empty path.
+    let path = if path.is_empty() { fullname } else { path };
 
     // Convert to path buffer and get last path component
     let pb = PathBuf::from(path);
     match pb.components().last() {
-        Some(c) => strip_suffix(c.as_os_str().to_str().unwrap(), suffix),
+        Some(c) => {
+            let name = c.as_os_str().to_str().unwrap();
+            if name == suffix {
+                name.to_string()
+            } else {
+                name.strip_suffix(suffix).unwrap_or(name).to_string()
+            }
+        }
+
         None => "".to_owned(),
     }
-}
-
-fn strip_suffix(name: &str, suffix: &str) -> String {
-    if name == suffix {
-        return name.to_owned();
-    }
-
-    if name.ends_with(suffix) {
-        return name[..name.len() - suffix.len()].to_owned();
-    }
-
-    name.to_owned()
 }

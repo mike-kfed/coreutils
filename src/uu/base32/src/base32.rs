@@ -5,30 +5,45 @@
 // For the full copyright and license information, please view the LICENSE file
 // that was distributed with this source code.
 
-#[macro_use]
-extern crate uucore;
-use uucore::encoding::Format;
+use std::io::{stdin, Read};
 
-mod base_common;
+use clap::Command;
+use uucore::{encoding::Format, error::UResult};
 
-static SYNTAX: &str = "[OPTION]... [FILE]";
-static SUMMARY: &str = "Base32 encode or decode FILE, or standard input, to standard output.";
-static LONG_HELP: &str = "
- With no FILE, or when FILE is -, read standard input.
+pub mod base_common;
 
- The data are encoded as described for the base32 alphabet in RFC
- 4648. When decoding, the input may contain newlines in addition
- to the bytes of the formal base32 alphabet. Use --ignore-garbage
- to attempt to recover from any other non-alphabet bytes in the
- encoded stream.
+static ABOUT: &str = "\
+With no FILE, or when FILE is -, read standard input.
+
+The data are encoded as described for the base32 alphabet in RFC
+4648. When decoding, the input may contain newlines in addition
+to the bytes of the formal base32 alphabet. Use --ignore-garbage
+to attempt to recover from any other non-alphabet bytes in the
+encoded stream.
 ";
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    base_common::execute(
-        args.collect_str(),
-        SYNTAX,
-        SUMMARY,
-        LONG_HELP,
-        Format::Base32,
+const USAGE: &str = "{} [OPTION]... [FILE]";
+
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let format = Format::Base32;
+
+    let config: base_common::Config = base_common::parse_base_cmd_args(args, ABOUT, USAGE)?;
+
+    // Create a reference to stdin so we can return a locked stdin from
+    // parse_base_cmd_args
+    let stdin_raw = stdin();
+    let mut input: Box<dyn Read> = base_common::get_input(&config, &stdin_raw)?;
+
+    base_common::handle_input(
+        &mut input,
+        format,
+        config.wrap_cols,
+        config.ignore_garbage,
+        config.decode,
     )
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    base_common::base_app(ABOUT, USAGE)
 }

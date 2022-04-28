@@ -8,11 +8,14 @@
 
 // spell-checker:ignore (ToDO) sourcepath targetpath
 
+mod error;
+
 #[macro_use]
 extern crate uucore;
 
-use clap::{App, Arg, ArgMatches};
+use clap::{crate_version, Arg, ArgMatches, Command};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, stdin};
 #[cfg(unix)]
@@ -20,17 +23,24 @@ use std::os::unix;
 #[cfg(windows)]
 use std::os::windows;
 use std::path::{Path, PathBuf};
+use uucore::backup_control::{self, BackupMode};
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UError, UResult, USimpleError, UUsageError};
+use uucore::format_usage;
 
 use fs_extra::dir::{move_dir, CopyOptions as DirCopyOptions};
+
+use crate::error::MvError;
 
 pub struct Behavior {
     overwrite: OverwriteMode,
     backup: BackupMode,
     suffix: String,
     update: bool,
-    target_dir: Option<String>,
+    target_dir: Option<OsString>,
     no_target_dir: bool,
     verbose: bool,
+    strip_slashes: bool,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -40,24 +50,17 @@ pub enum OverwriteMode {
     Force,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum BackupMode {
-    NoBackup,
-    SimpleBackup,
-    NumberedBackup,
-    ExistingBackup,
-}
-
 static ABOUT: &str = "Move SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+static LONG_HELP: &str = "";
+const USAGE: &str = "\
+    {} [OPTION]... [-T] SOURCE DEST
+    {} [OPTION]... SOURCE... DIRECTORY
+    {} [OPTION]... -t DIRECTORY SOURCE...";
 
-static OPT_BACKUP: &str = "backup";
-static OPT_BACKUP_NO_ARG: &str = "b";
 static OPT_FORCE: &str = "force";
 static OPT_INTERACTIVE: &str = "interactive";
 static OPT_NO_CLOBBER: &str = "no-clobber";
 static OPT_STRIP_TRAILING_SLASHES: &str = "strip-trailing-slashes";
-static OPT_SUFFIX: &str = "suffix";
 static OPT_TARGET_DIRECTORY: &str = "target-directory";
 static OPT_NO_TARGET_DIRECTORY: &str = "no-target-directory";
 static OPT_UPDATE: &str = "update";
@@ -65,151 +68,122 @@ static OPT_VERBOSE: &str = "verbose";
 
 static ARG_FILES: &str = "files";
 
-fn get_usage() -> String {
-    format!(
-        "{0} [OPTION]... [-T] SOURCE DEST
-{0} [OPTION]... SOURCE... DIRECTORY
-{0} [OPTION]... -t DIRECTORY SOURCE...",
-        executable!()
-    )
-}
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uu_app()
+        .after_help(&*format!(
+            "{}\n{}",
+            LONG_HELP,
+            backup_control::BACKUP_CONTROL_LONG_HELP
+        ))
+        .get_matches_from(args);
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-
-    let matches = App::new(executable!())
-        .version(VERSION)
-        .about(ABOUT)
-        .usage(&usage[..])
-    .arg(
-            Arg::with_name(OPT_BACKUP)
-            .long(OPT_BACKUP)
-            .help("make a backup of each existing destination file")
-            .takes_value(true)
-            .possible_value("simple")
-            .possible_value("never")
-            .possible_value("numbered")
-            .possible_value("t")
-            .possible_value("existing")
-            .possible_value("nil")
-            .possible_value("none")
-            .possible_value("off")
-            .value_name("CONTROL")
-    )
-    .arg(
-            Arg::with_name(OPT_BACKUP_NO_ARG)
-            .short(OPT_BACKUP_NO_ARG)
-            .help("like --backup but does not accept an argument")
-    )
-    .arg(
-            Arg::with_name(OPT_FORCE)
-            .short("f")
-            .long(OPT_FORCE)
-            .help("do not prompt before overwriting")
-    )
-    .arg(
-            Arg::with_name(OPT_INTERACTIVE)
-            .short("i")
-            .long(OPT_INTERACTIVE)
-            .help("prompt before override")
-    )
-    .arg(
-            Arg::with_name(OPT_NO_CLOBBER).short("n")
-            .long(OPT_NO_CLOBBER)
-            .help("do not overwrite an existing file")
-    )
-    .arg(
-            Arg::with_name(OPT_STRIP_TRAILING_SLASHES)
-            .long(OPT_STRIP_TRAILING_SLASHES)
-            .help("remove any trailing slashes from each SOURCE argument")
-    )
-    .arg(
-            Arg::with_name(OPT_SUFFIX)
-            .short("S")
-            .long(OPT_SUFFIX)
-            .help("override the usual backup suffix")
-            .takes_value(true)
-            .value_name("SUFFIX")
-    )
-    .arg(
-        Arg::with_name(OPT_TARGET_DIRECTORY)
-        .short("t")
-        .long(OPT_TARGET_DIRECTORY)
-        .help("move all SOURCE arguments into DIRECTORY")
-        .takes_value(true)
-        .value_name("DIRECTORY")
-        .conflicts_with(OPT_NO_TARGET_DIRECTORY)
-    )
-    .arg(
-            Arg::with_name(OPT_NO_TARGET_DIRECTORY)
-            .short("T")
-            .long(OPT_NO_TARGET_DIRECTORY).
-            help("treat DEST as a normal file")
-    )
-    .arg(
-            Arg::with_name(OPT_UPDATE)
-            .short("u")
-            .long(OPT_UPDATE)
-            .help("move only when the SOURCE file is newer than the destination file or when the destination file is missing")
-    )
-    .arg(
-            Arg::with_name(OPT_VERBOSE)
-            .short("v")
-            .long(OPT_VERBOSE).help("explain what is being done")
-    )
-    .arg(
-        Arg::with_name(ARG_FILES)
-            .multiple(true)
-            .takes_value(true)
-            .min_values(2)
-            .required(true)
-        )
-    .get_matches_from(args);
-
-    let files: Vec<String> = matches
-        .values_of(ARG_FILES)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
+    let files: Vec<OsString> = matches
+        .values_of_os(ARG_FILES)
+        .unwrap_or_default()
+        .map(|v| v.to_os_string())
+        .collect();
 
     let overwrite_mode = determine_overwrite_mode(&matches);
-    let backup_mode = determine_backup_mode(&matches);
+    let backup_mode = backup_control::determine_backup_mode(&matches)?;
 
     if overwrite_mode == OverwriteMode::NoClobber && backup_mode != BackupMode::NoBackup {
-        show_error!(
-            "options --backup and --no-clobber are mutually exclusive\n\
-             Try '{} --help' for more information.",
-            executable!()
-        );
-        return 1;
+        return Err(UUsageError::new(
+            1,
+            "options --backup and --no-clobber are mutually exclusive",
+        ));
     }
 
-    let backup_suffix = determine_backup_suffix(backup_mode, &matches);
+    let backup_suffix = backup_control::determine_backup_suffix(&matches);
 
     let behavior = Behavior {
         overwrite: overwrite_mode,
         backup: backup_mode,
         suffix: backup_suffix,
         update: matches.is_present(OPT_UPDATE),
-        target_dir: matches.value_of(OPT_TARGET_DIRECTORY).map(String::from),
+        target_dir: matches
+            .value_of_os(OPT_TARGET_DIRECTORY)
+            .map(OsString::from),
         no_target_dir: matches.is_present(OPT_NO_TARGET_DIRECTORY),
         verbose: matches.is_present(OPT_VERBOSE),
+        strip_slashes: matches.is_present(OPT_STRIP_TRAILING_SLASHES),
     };
 
-    let paths: Vec<PathBuf> = {
-        fn strip_slashes(p: &Path) -> &Path {
-            p.components().as_path()
-        }
-        let to_owned = |p: &Path| p.to_owned();
-        let paths = files.iter().map(Path::new);
+    exec(&files[..], &behavior)
+}
 
-        if matches.is_present(OPT_STRIP_TRAILING_SLASHES) {
-            paths.map(strip_slashes).map(to_owned).collect()
-        } else {
-            paths.map(to_owned).collect()
-        }
-    };
-
-    exec(&paths[..], behavior)
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+    .arg(
+        backup_control::arguments::backup()
+    )
+    .arg(
+        backup_control::arguments::backup_no_args()
+    )
+    .arg(
+            Arg::new(OPT_FORCE)
+            .short('f')
+            .long(OPT_FORCE)
+            .help("do not prompt before overwriting")
+    )
+    .arg(
+            Arg::new(OPT_INTERACTIVE)
+            .short('i')
+            .long(OPT_INTERACTIVE)
+            .help("prompt before override")
+    )
+    .arg(
+            Arg::new(OPT_NO_CLOBBER).short('n')
+            .long(OPT_NO_CLOBBER)
+            .help("do not overwrite an existing file")
+    )
+    .arg(
+            Arg::new(OPT_STRIP_TRAILING_SLASHES)
+            .long(OPT_STRIP_TRAILING_SLASHES)
+            .help("remove any trailing slashes from each SOURCE argument")
+    )
+    .arg(
+        backup_control::arguments::suffix()
+    )
+    .arg(
+        Arg::new(OPT_TARGET_DIRECTORY)
+        .short('t')
+        .long(OPT_TARGET_DIRECTORY)
+        .help("move all SOURCE arguments into DIRECTORY")
+        .takes_value(true)
+        .value_name("DIRECTORY")
+        .conflicts_with(OPT_NO_TARGET_DIRECTORY)
+        .allow_invalid_utf8(true)
+    )
+    .arg(
+            Arg::new(OPT_NO_TARGET_DIRECTORY)
+            .short('T')
+            .long(OPT_NO_TARGET_DIRECTORY).
+            help("treat DEST as a normal file")
+    )
+    .arg(
+            Arg::new(OPT_UPDATE)
+            .short('u')
+            .long(OPT_UPDATE)
+            .help("move only when the SOURCE file is newer than the destination file or when the destination file is missing")
+    )
+    .arg(
+            Arg::new(OPT_VERBOSE)
+            .short('v')
+            .long(OPT_VERBOSE).help("explain what is being done")
+    )
+    .arg(
+        Arg::new(ARG_FILES)
+            .multiple_occurrences(true)
+            .takes_value(true)
+            .min_values(2)
+            .required(true)
+            .allow_invalid_utf8(true)
+        )
 }
 
 fn determine_overwrite_mode(matches: &ArgMatches) -> OverwriteMode {
@@ -227,160 +201,143 @@ fn determine_overwrite_mode(matches: &ArgMatches) -> OverwriteMode {
     }
 }
 
-fn determine_backup_mode(matches: &ArgMatches) -> BackupMode {
-    if matches.is_present(OPT_BACKUP_NO_ARG) {
-        BackupMode::SimpleBackup
-    } else if matches.is_present(OPT_BACKUP) {
-        match matches.value_of(OPT_BACKUP).map(String::from) {
-            None => BackupMode::SimpleBackup,
-            Some(mode) => match &mode[..] {
-                "simple" | "never" => BackupMode::SimpleBackup,
-                "numbered" | "t" => BackupMode::NumberedBackup,
-                "existing" | "nil" => BackupMode::ExistingBackup,
-                "none" | "off" => BackupMode::NoBackup,
-                _ => panic!(), // cannot happen as it is managed by clap
-            },
+fn exec(files: &[OsString], b: &Behavior) -> UResult<()> {
+    let paths: Vec<PathBuf> = {
+        let paths = files.iter().map(Path::new);
+
+        // Strip slashes from path, if strip opt present
+        if b.strip_slashes {
+            paths
+                .map(|p| p.components().as_path().to_owned())
+                .collect::<Vec<PathBuf>>()
+        } else {
+            paths.map(|p| p.to_owned()).collect::<Vec<PathBuf>>()
         }
-    } else {
-        BackupMode::NoBackup
-    }
-}
+    };
 
-fn determine_backup_suffix(backup_mode: BackupMode, matches: &ArgMatches) -> String {
-    if matches.is_present(OPT_SUFFIX) {
-        matches.value_of(OPT_SUFFIX).map(String::from).unwrap()
-    } else if let (Ok(s), BackupMode::SimpleBackup) =
-        (env::var("SIMPLE_BACKUP_SUFFIX"), backup_mode)
-    {
-        s
-    } else {
-        "~".to_owned()
-    }
-}
-
-fn exec(files: &[PathBuf], b: Behavior) -> i32 {
     if let Some(ref name) = b.target_dir {
-        return move_files_into_dir(files, &PathBuf::from(name), &b);
+        return move_files_into_dir(&paths, &PathBuf::from(name), b);
     }
-    match files.len() {
+    match paths.len() {
         /* case 0/1 are not possible thanks to clap */
         2 => {
-            let source = &files[0];
-            let target = &files[1];
+            let source = &paths[0];
+            let target = &paths[1];
             // Here we use the `symlink_metadata()` method instead of `exists()`,
             // since it handles dangling symlinks correctly. The method gives an
             // `Ok()` results unless the source does not exist, or the user
             // lacks permission to access metadata.
             if source.symlink_metadata().is_err() {
-                show_error!(
-                    "cannot stat ‘{}’: No such file or directory",
-                    source.display()
-                );
-                return 1;
+                return Err(MvError::NoSuchFile(source.quote().to_string()).into());
+            }
+
+            // GNU semantics are: if the source and target are the same, no move occurs and we print an error
+            if source.eq(target) {
+                // Done to match GNU semantics for the dot file
+                if source.eq(Path::new(".")) || source.ends_with("/.") || source.is_file() {
+                    return Err(MvError::SameFile(
+                        source.quote().to_string(),
+                        target.quote().to_string(),
+                    )
+                    .into());
+                } else {
+                    return Err(MvError::SelfSubdirectory(source.display().to_string()).into());
+                }
             }
 
             if target.is_dir() {
                 if b.no_target_dir {
                     if !source.is_dir() {
-                        show_error!(
-                            "cannot overwrite directory ‘{}’ with non-directory",
-                            target.display()
-                        );
-                        return 1;
+                        Err(MvError::DirectoryToNonDirectory(target.quote().to_string()).into())
+                    } else {
+                        rename(source, target, b).map_err_context(|| {
+                            format!("cannot move {} to {}", source.quote(), target.quote())
+                        })
                     }
-
-                    return match rename(source, target, &b) {
-                        Err(e) => {
-                            show_error!(
-                                "cannot move ‘{}’ to ‘{}’: {}",
-                                source.display(),
-                                target.display(),
-                                e
-                            );
-                            1
-                        }
-                        _ => 0,
-                    };
+                } else {
+                    move_files_into_dir(&[source.clone()], target, b)
                 }
-
-                return move_files_into_dir(&[source.clone()], target, &b);
             } else if target.exists() && source.is_dir() {
-                show_error!(
-                    "cannot overwrite non-directory ‘{}’ with directory ‘{}’",
-                    target.display(),
-                    source.display()
-                );
-                return 1;
-            }
-
-            if let Err(e) = rename(source, target, &b) {
-                show_error!("{}", e);
-                return 1;
+                match b.overwrite {
+                    OverwriteMode::NoClobber => return Ok(()),
+                    OverwriteMode::Interactive => {
+                        println!("{}: overwrite {}? ", uucore::util_name(), target.quote());
+                        if !read_yes() {
+                            return Ok(());
+                        }
+                    }
+                    OverwriteMode::Force => {}
+                };
+                Err(MvError::NonDirectoryToDirectory(
+                    source.quote().to_string(),
+                    target.quote().to_string(),
+                )
+                .into())
+            } else {
+                rename(source, target, b).map_err(|e| USimpleError::new(1, format!("{}", e)))
             }
         }
         _ => {
             if b.no_target_dir {
-                show_error!(
-                    "mv: extra operand ‘{}’\n\
-                     Try '{} --help' for more information.",
-                    files[2].display(),
-                    executable!()
-                );
-                return 1;
+                return Err(UUsageError::new(
+                    1,
+                    format!("mv: extra operand {}", files[2].quote()),
+                ));
             }
-            let target_dir = files.last().unwrap();
-            move_files_into_dir(&files[..files.len() - 1], target_dir, &b);
+            let target_dir = paths.last().unwrap();
+            let sources = &paths[..paths.len() - 1];
+
+            // Check if we have mv dir1 dir2 dir2
+            // And generate an error if this is the case
+            if sources.contains(target_dir) {
+                return Err(USimpleError::new(
+                    1,
+                    format!(
+                        "cannot move {} to a subdirectory of itself, '{}/{}'",
+                        target_dir.quote(),
+                        target_dir.display(),
+                        target_dir.display()
+                    ),
+                ));
+            }
+
+            move_files_into_dir(sources, target_dir, b)
         }
     }
-    0
 }
 
-fn move_files_into_dir(files: &[PathBuf], target_dir: &PathBuf, b: &Behavior) -> i32 {
+fn move_files_into_dir(files: &[PathBuf], target_dir: &Path, b: &Behavior) -> UResult<()> {
     if !target_dir.is_dir() {
-        show_error!("target ‘{}’ is not a directory", target_dir.display());
-        return 1;
+        return Err(MvError::NotADirectory(target_dir.quote().to_string()).into());
     }
 
-    let mut all_successful = true;
     for sourcepath in files.iter() {
         let targetpath = match sourcepath.file_name() {
             Some(name) => target_dir.join(name),
             None => {
-                show_error!(
-                    "cannot stat ‘{}’: No such file or directory",
-                    sourcepath.display()
-                );
-
-                all_successful = false;
+                show!(MvError::NoSuchFile(sourcepath.quote().to_string()));
                 continue;
             }
         };
-
-        if let Err(e) = rename(sourcepath, &targetpath, b) {
-            show_error!(
-                "mv: cannot move ‘{}’ to ‘{}’: {}",
-                sourcepath.display(),
-                targetpath.display(),
-                e
-            );
-            all_successful = false;
-        }
+        show_if_err!(
+            rename(sourcepath, &targetpath, b).map_err_context(|| format!(
+                "cannot move {} to {}",
+                sourcepath.quote(),
+                targetpath.quote()
+            ))
+        );
     }
-    if all_successful {
-        0
-    } else {
-        1
-    }
+    Ok(())
 }
 
-fn rename(from: &PathBuf, to: &PathBuf, b: &Behavior) -> io::Result<()> {
+fn rename(from: &Path, to: &Path, b: &Behavior) -> io::Result<()> {
     let mut backup_path = None;
 
     if to.exists() {
         match b.overwrite {
             OverwriteMode::NoClobber => return Ok(()),
             OverwriteMode::Interactive => {
-                print!("{}: overwrite ‘{}’? ", executable!(), to.display());
+                println!("{}: overwrite {}? ", uucore::util_name(), to.quote());
                 if !read_yes() {
                     return Ok(());
                 }
@@ -388,12 +345,7 @@ fn rename(from: &PathBuf, to: &PathBuf, b: &Behavior) -> io::Result<()> {
             OverwriteMode::Force => {}
         };
 
-        backup_path = match b.backup {
-            BackupMode::NoBackup => None,
-            BackupMode::SimpleBackup => Some(simple_backup_path(to, &b.suffix)),
-            BackupMode::NumberedBackup => Some(numbered_backup_path(to)),
-            BackupMode::ExistingBackup => Some(existing_backup_path(to, &b.suffix)),
-        };
+        backup_path = backup_control::get_backup_path(b.backup, to, &b.suffix);
         if let Some(ref backup_path) = backup_path {
             rename_with_fallback(to, backup_path)?;
         }
@@ -408,7 +360,7 @@ fn rename(from: &PathBuf, to: &PathBuf, b: &Behavior) -> io::Result<()> {
         // normalize behavior between *nix and windows
         if from.is_dir() {
             if is_empty_dir(to) {
-                fs::remove_dir(to)?
+                fs::remove_dir(to)?;
             } else {
                 return Err(io::Error::new(io::ErrorKind::Other, "Directory not empty"));
             }
@@ -418,9 +370,9 @@ fn rename(from: &PathBuf, to: &PathBuf, b: &Behavior) -> io::Result<()> {
     rename_with_fallback(from, to)?;
 
     if b.verbose {
-        print!("‘{}’ -> ‘{}’", from.display(), to.display());
+        print!("{} -> {}", from.quote(), to.quote());
         match backup_path {
-            Some(path) => println!(" (backup: ‘{}’)", path.display()),
+            Some(path) => println!(" (backup: {})", path.quote()),
             None => println!(),
         }
     }
@@ -429,14 +381,14 @@ fn rename(from: &PathBuf, to: &PathBuf, b: &Behavior) -> io::Result<()> {
 
 /// A wrapper around `fs::rename`, so that if it fails, we try falling back on
 /// copying and removing.
-fn rename_with_fallback(from: &PathBuf, to: &PathBuf) -> io::Result<()> {
+fn rename_with_fallback(from: &Path, to: &Path) -> io::Result<()> {
     if fs::rename(from, to).is_err() {
         // Get metadata without following symlinks
         let metadata = from.symlink_metadata()?;
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() {
-            rename_symlink_fallback(&from, &to)?;
+            rename_symlink_fallback(from, to)?;
         } else if file_type.is_dir() {
             // We remove the destination directory if it exists to match the
             // behavior of `fs::rename`. As far as I can tell, `fs_extra`'s
@@ -452,7 +404,13 @@ fn rename_with_fallback(from: &PathBuf, to: &PathBuf) -> io::Result<()> {
                 ..DirCopyOptions::new()
             };
             if let Err(err) = move_dir(from, to, &options) {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err)));
+                return match err.kind {
+                    fs_extra::error::ErrorKind::PermissionDenied => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Permission denied",
+                    )),
+                    _ => Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err))),
+                };
             }
         } else {
             fs::copy(from, to).and_then(|_| fs::remove_file(from))?;
@@ -464,7 +422,7 @@ fn rename_with_fallback(from: &PathBuf, to: &PathBuf) -> io::Result<()> {
 /// Move the given symlink to the given destination. On Windows, dangling
 /// symlinks return an error.
 #[inline]
-fn rename_symlink_fallback(from: &PathBuf, to: &PathBuf) -> io::Result<()> {
+fn rename_symlink_fallback(from: &Path, to: &Path) -> io::Result<()> {
     let path_symlink_points_to = fs::read_link(from)?;
     #[cfg(unix)]
     {
@@ -507,29 +465,7 @@ fn read_yes() -> bool {
     }
 }
 
-fn simple_backup_path(path: &PathBuf, suffix: &str) -> PathBuf {
-    let mut p = path.to_string_lossy().into_owned();
-    p.push_str(suffix);
-    PathBuf::from(p)
-}
-
-fn numbered_backup_path(path: &PathBuf) -> PathBuf {
-    (1_u64..)
-        .map(|i| path.with_extension(format!("~{}~", i)))
-        .find(|p| !p.exists())
-        .expect("cannot create backup")
-}
-
-fn existing_backup_path(path: &PathBuf, suffix: &str) -> PathBuf {
-    let test_path = path.with_extension("~1~");
-    if test_path.exists() {
-        numbered_backup_path(path)
-    } else {
-        simple_backup_path(path, suffix)
-    }
-}
-
-fn is_empty_dir(path: &PathBuf) -> bool {
+fn is_empty_dir(path: &Path) -> bool {
     match fs::read_dir(path) {
         Ok(contents) => contents.peekable().peek().is_none(),
         Err(_e) => false,

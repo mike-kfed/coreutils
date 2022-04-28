@@ -10,57 +10,34 @@
 #[macro_use]
 extern crate uucore;
 
-use clap::{App, Arg};
-use std::fs;
-use std::path::PathBuf;
-use uucore::fs::{canonicalize, CanonicalizeMode};
+use clap::{crate_version, Arg, Command};
+use std::{
+    io::{stdout, Write},
+    path::{Path, PathBuf},
+};
+use uucore::{
+    display::{print_verbatim, Quotable},
+    error::{FromIo, UResult},
+    format_usage,
+    fs::{canonicalize, MissingHandling, ResolveMode},
+};
 
 static ABOUT: &str = "print the resolved path";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+const USAGE: &str = "{} [OPTION]... FILE...";
 
 static OPT_QUIET: &str = "quiet";
 static OPT_STRIP: &str = "strip";
 static OPT_ZERO: &str = "zero";
+static OPT_PHYSICAL: &str = "physical";
+static OPT_LOGICAL: &str = "logical";
+const OPT_CANONICALIZE_MISSING: &str = "canonicalize-missing";
+const OPT_CANONICALIZE_EXISTING: &str = "canonicalize-existing";
 
 static ARG_FILES: &str = "files";
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]... FILE...", executable!())
-}
-
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-
-    let matches = App::new(executable!())
-        .version(VERSION)
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(OPT_QUIET)
-                .short("q")
-                .long(OPT_QUIET)
-                .help("Do not print warnings for invalid paths"),
-        )
-        .arg(
-            Arg::with_name(OPT_STRIP)
-                .short("s")
-                .long(OPT_STRIP)
-                .help("Only strip '.' and '..' components, but don't resolve symbolic links"),
-        )
-        .arg(
-            Arg::with_name(OPT_ZERO)
-                .short("z")
-                .long(OPT_ZERO)
-                .help("Separate output filenames with \\0 rather than newline"),
-        )
-        .arg(
-            Arg::with_name(ARG_FILES)
-                .multiple(true)
-                .takes_value(true)
-                .required(true)
-                .min_values(1),
-        )
-        .get_matches_from(args);
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uu_app().get_matches_from(args);
 
     /*  the list of files */
 
@@ -73,66 +50,119 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let strip = matches.is_present(OPT_STRIP);
     let zero = matches.is_present(OPT_ZERO);
     let quiet = matches.is_present(OPT_QUIET);
-    let mut retcode = 0;
+    let logical = matches.is_present(OPT_LOGICAL);
+    let can_mode = if matches.is_present(OPT_CANONICALIZE_EXISTING) {
+        MissingHandling::Existing
+    } else if matches.is_present(OPT_CANONICALIZE_MISSING) {
+        MissingHandling::Missing
+    } else {
+        MissingHandling::Normal
+    };
     for path in &paths {
-        if !resolve_path(path, strip, zero, quiet) {
-            retcode = 1
-        };
+        let result = resolve_path(path, strip, zero, logical, can_mode);
+        if !quiet {
+            show_if_err!(result.map_err_context(|| path.maybe_quote().to_string()));
+        }
     }
-    retcode
+    // Although we return `Ok`, it is possible that a call to
+    // `show!()` above has set the exit code for the program to a
+    // non-zero integer.
+    Ok(())
 }
 
-fn resolve_path(p: &PathBuf, strip: bool, zero: bool, quiet: bool) -> bool {
-    let abs = canonicalize(p, CanonicalizeMode::Normal).unwrap();
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(OPT_QUIET)
+                .short('q')
+                .long(OPT_QUIET)
+                .help("Do not print warnings for invalid paths"),
+        )
+        .arg(
+            Arg::new(OPT_STRIP)
+                .short('s')
+                .long(OPT_STRIP)
+                .help("Only strip '.' and '..' components, but don't resolve symbolic links"),
+        )
+        .arg(
+            Arg::new(OPT_ZERO)
+                .short('z')
+                .long(OPT_ZERO)
+                .help("Separate output filenames with \\0 rather than newline"),
+        )
+        .arg(
+            Arg::new(OPT_LOGICAL)
+                .short('L')
+                .long(OPT_LOGICAL)
+                .help("resolve '..' components before symlinks"),
+        )
+        .arg(
+            Arg::new(OPT_PHYSICAL)
+                .short('P')
+                .long(OPT_PHYSICAL)
+                .overrides_with_all(&[OPT_STRIP, OPT_LOGICAL])
+                .help("resolve symlinks as encountered (default)"),
+        )
+        .arg(
+            Arg::new(OPT_CANONICALIZE_EXISTING)
+                .short('e')
+                .long(OPT_CANONICALIZE_EXISTING)
+                .help(
+                    "canonicalize by following every symlink in every component of the \
+                     given name recursively, all components must exist",
+                ),
+        )
+        .arg(
+            Arg::new(OPT_CANONICALIZE_MISSING)
+                .short('m')
+                .long(OPT_CANONICALIZE_MISSING)
+                .help(
+                    "canonicalize by following every symlink in every component of the \
+                     given name recursively, without requirements on components existence",
+                ),
+        )
+        .arg(
+            Arg::new(ARG_FILES)
+                .multiple_occurrences(true)
+                .takes_value(true)
+                .required(true)
+                .min_values(1),
+        )
+}
 
-    if strip {
-        if zero {
-            print!("{}\0", p.display());
-        } else {
-            println!("{}", p.display())
-        }
-        return true;
-    }
-
-    let mut result = PathBuf::new();
-    let mut links_left = 256;
-
-    for part in abs.components() {
-        result.push(part.as_os_str());
-        loop {
-            if links_left == 0 {
-                if !quiet {
-                    show_error!("Too many symbolic links: {}", p.display())
-                };
-                return false;
-            }
-            match fs::metadata(result.as_path()) {
-                Err(_) => break,
-                Ok(ref m) if !m.file_type().is_symlink() => break,
-                Ok(_) => {
-                    links_left -= 1;
-                    match fs::read_link(result.as_path()) {
-                        Ok(x) => {
-                            result.pop();
-                            result.push(x.as_path());
-                        }
-                        _ => {
-                            if !quiet {
-                                show_error!("Invalid path: {}", p.display())
-                            };
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if zero {
-        print!("{}\0", result.display());
+/// Resolve a path to an absolute form and print it.
+///
+/// If `strip` is `true`, then this function does not attempt to resolve
+/// symbolic links in the path. If `zero` is `true`, then this function
+/// prints the path followed by the null byte (`'\0'`) instead of a
+/// newline character (`'\n'`).
+///
+/// # Errors
+///
+/// This function returns an error if there is a problem resolving
+/// symbolic links.
+fn resolve_path(
+    p: &Path,
+    strip: bool,
+    zero: bool,
+    logical: bool,
+    can_mode: MissingHandling,
+) -> std::io::Result<()> {
+    let resolve = if strip {
+        ResolveMode::None
+    } else if logical {
+        ResolveMode::Logical
     } else {
-        println!("{}", result.display());
-    }
+        ResolveMode::Physical
+    };
+    let abs = canonicalize(p, can_mode, resolve)?;
+    let line_ending = if zero { b'\0' } else { b'\n' };
 
-    true
+    print_verbatim(&abs)?;
+    stdout().write_all(&[line_ending])?;
+    Ok(())
 }

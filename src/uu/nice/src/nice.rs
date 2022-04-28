@@ -10,123 +10,112 @@
 #[macro_use]
 extern crate uucore;
 
-use libc::{c_char, c_int, execvp};
+use libc::{c_char, c_int, execvp, PRIO_PROCESS};
 use std::ffi::CString;
 use std::io::Error;
 use std::ptr;
 
-const NAME: &str = "nice";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use clap::{crate_version, Arg, Command};
+use uucore::{
+    error::{set_exit_code, UResult, USimpleError, UUsageError},
+    format_usage,
+};
 
-// XXX: PRIO_PROCESS is 0 on at least FreeBSD and Linux.  Don't know about Mac OS X.
-const PRIO_PROCESS: c_int = 0;
-
-extern "C" {
-    fn getpriority(which: c_int, who: c_int) -> c_int;
-    fn setpriority(which: c_int, who: c_int, prio: c_int) -> c_int;
+pub mod options {
+    pub static ADJUSTMENT: &str = "adjustment";
+    pub static COMMAND: &str = "COMMAND";
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+const ABOUT: &str = "\
+    Run COMMAND with an adjusted niceness, which affects process scheduling. \
+    With no COMMAND, print the current niceness.  Niceness values range from at \
+    least -20 (most favorable to the process) to 19 (least favorable to the \
+    process).";
+const USAGE: &str = "{} [OPTIONS] [COMMAND [ARGS]]";
 
-    let mut opts = getopts::Options::new();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uu_app().get_matches_from(args);
 
-    opts.optopt(
-        "n",
-        "adjustment",
-        "add N to the niceness (default is 10)",
-        "N",
-    );
-    opts.optflag("h", "help", "display this help and exit");
-    opts.optflag("V", "version", "output version information and exit");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(err) => {
-            show_error!("{}", err);
-            return 125;
-        }
+    let mut niceness = unsafe {
+        nix::errno::Errno::clear();
+        libc::getpriority(PRIO_PROCESS, 0)
     };
-
-    if matches.opt_present("version") {
-        println!("{} {}", NAME, VERSION);
-        return 0;
-    }
-
-    if matches.opt_present("help") {
-        let msg = format!(
-            "{0} {1}
-
-Usage:
-  {0} [OPTIONS] [COMMAND [ARGS]]
-
-Run COMMAND with an adjusted niceness, which affects process scheduling.
-With no COMMAND, print the current niceness.  Niceness values range from at
-least -20 (most favorable to the process) to 19 (least favorable to the
-process).",
-            NAME, VERSION
-        );
-
-        print!("{}", opts.usage(&msg));
-        return 0;
-    }
-
-    let mut niceness = unsafe { getpriority(PRIO_PROCESS, 0) };
     if Error::last_os_error().raw_os_error().unwrap() != 0 {
-        show_error!("{}", Error::last_os_error());
-        return 125;
+        return Err(USimpleError::new(
+            125,
+            format!("getpriority: {}", Error::last_os_error()),
+        ));
     }
 
-    let adjustment = match matches.opt_str("adjustment") {
+    let adjustment = match matches.value_of(options::ADJUSTMENT) {
         Some(nstr) => {
-            if matches.free.is_empty() {
-                show_error!(
-                    "A command must be given with an adjustment.
-                                Try \"{} --help\" for more information.",
-                    args[0]
-                );
-                return 125;
+            if !matches.is_present(options::COMMAND) {
+                return Err(UUsageError::new(
+                    125,
+                    "A command must be given with an adjustment.",
+                ));
             }
             match nstr.parse() {
                 Ok(num) => num,
                 Err(e) => {
-                    show_error!("\"{}\" is not a valid number: {}", nstr, e);
-                    return 125;
+                    return Err(USimpleError::new(
+                        125,
+                        format!("\"{}\" is not a valid number: {}", nstr, e),
+                    ))
                 }
             }
         }
         None => {
-            if matches.free.is_empty() {
+            if !matches.is_present(options::COMMAND) {
                 println!("{}", niceness);
-                return 0;
+                return Ok(());
             }
             10_i32
         }
     };
 
     niceness += adjustment;
-    unsafe {
-        setpriority(PRIO_PROCESS, 0, niceness);
-    }
-    if Error::last_os_error().raw_os_error().unwrap() != 0 {
-        show_warning!("{}", Error::last_os_error());
+    if unsafe { libc::setpriority(PRIO_PROCESS, 0, niceness) } == -1 {
+        show_warning!("setpriority: {}", Error::last_os_error());
     }
 
     let cstrs: Vec<CString> = matches
-        .free
-        .iter()
+        .values_of(options::COMMAND)
+        .unwrap()
         .map(|x| CString::new(x.as_bytes()).unwrap())
         .collect();
+
     let mut args: Vec<*const c_char> = cstrs.iter().map(|s| s.as_ptr()).collect();
     args.push(ptr::null::<c_char>());
     unsafe {
         execvp(args[0], args.as_mut_ptr());
     }
 
-    show_error!("{}", Error::last_os_error());
-    if Error::last_os_error().raw_os_error().unwrap() as c_int == libc::ENOENT {
+    show_error!("execvp: {}", Error::last_os_error());
+    let exit_code = if Error::last_os_error().raw_os_error().unwrap() as c_int == libc::ENOENT {
         127
     } else {
         126
-    }
+    };
+    set_exit_code(exit_code);
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .trailing_var_arg(true)
+        .infer_long_args(true)
+        .version(crate_version!())
+        .arg(
+            Arg::new(options::ADJUSTMENT)
+                .short('n')
+                .long(options::ADJUSTMENT)
+                .help("add N to the niceness (default is 10)")
+                .takes_value(true)
+                .allow_hyphen_values(true),
+        )
+        .arg(Arg::new(options::COMMAND).multiple_occurrences(true))
 }

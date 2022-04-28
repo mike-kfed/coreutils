@@ -5,54 +5,35 @@
 //  *
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
-
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, Arg, Command};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{stdin, BufRead, BufReader, Read};
 use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult, USimpleError};
+use uucore::{format_usage, InvalidEncodingHandling};
 
-static NAME: &str = "tsort";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+static SUMMARY: &str = "Topological sort the strings in FILE.
+Strings are defined as any sequence of tokens separated by whitespace (tab, space, or newline).
+If FILE is not passed in, stdin is used instead.";
+static USAGE: &str = "tsort [OPTIONS] FILE";
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+mod options {
+    pub const FILE: &str = "file";
+}
 
-    let mut opts = getopts::Options::new();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
 
-    opts.optflag("h", "help", "display this help and exit");
-    opts.optflag("V", "version", "output version information and exit");
+    let matches = uu_app().get_matches_from(args);
 
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => crash!(1, "{}", f),
-    };
-
-    if matches.opt_present("h") {
-        println!("{} {}", NAME, VERSION);
-        println!();
-        println!("Usage:");
-        println!("  {} [OPTIONS] FILE", NAME);
-        println!();
-        println!("{}", opts.usage("Topological sort the strings in FILE. Strings are defined as any sequence of tokens separated by whitespace (tab, space, or newline). If FILE is not passed in, stdin is used instead."));
-        return 0;
-    }
-
-    if matches.opt_present("V") {
-        println!("{} {}", NAME, VERSION);
-        return 0;
-    }
-
-    let files = matches.free.clone();
-    let input = if files.len() > 1 {
-        crash!(1, "{}, extra operand '{}'", NAME, matches.free[1]);
-    } else if files.is_empty() {
-        "-".to_owned()
-    } else {
-        files[0].clone()
-    };
+    let input = matches
+        .value_of(options::FILE)
+        .expect("Value is required by clap");
 
     let mut stdin_buf;
     let mut file_buf;
@@ -60,13 +41,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         stdin_buf = stdin();
         &mut stdin_buf as &mut dyn Read
     } else {
-        file_buf = match File::open(Path::new(&input)) {
-            Ok(a) => a,
-            _ => {
-                show_error!("{}: No such file or directory", input);
-                return 1;
-            }
-        };
+        file_buf = File::open(Path::new(&input)).map_err_context(|| input.to_string())?;
         &mut file_buf as &mut dyn Read
     });
 
@@ -86,7 +61,15 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 for ab in tokens.chunks(2) {
                     match ab.len() {
                         2 => g.add_edge(&ab[0], &ab[1]),
-                        _ => crash!(1, "{}: input contains an odd number of tokens", input),
+                        _ => {
+                            return Err(USimpleError::new(
+                                1,
+                                format!(
+                                    "{}: input contains an odd number of tokens",
+                                    input.maybe_quote()
+                                ),
+                            ))
+                        }
                     }
                 }
             }
@@ -97,18 +80,31 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     g.run_tsort();
 
     if !g.is_acyclic() {
-        crash!(1, "{}, input contains a loop:", input);
+        return Err(USimpleError::new(
+            1,
+            format!("{}, input contains a loop:", input),
+        ));
     }
 
     for x in &g.result {
         println!("{}", x);
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .override_usage(format_usage(USAGE))
+        .about(SUMMARY)
+        .infer_long_args(true)
+        .arg(Arg::new(options::FILE).default_value("-").hide(true))
 }
 
 // We use String as a representation of node here
 // but using integer may improve performance.
+#[derive(Default)]
 struct Graph {
     in_edges: HashMap<String, HashSet<String>>,
     out_edges: HashMap<String, Vec<String>>,
@@ -116,12 +112,8 @@ struct Graph {
 }
 
 impl Graph {
-    fn new() -> Graph {
-        Graph {
-            in_edges: HashMap::new(),
-            out_edges: HashMap::new(),
-            result: vec![],
-        }
+    fn new() -> Self {
+        Self::default()
     }
 
     fn has_node(&self, n: &str) -> bool {

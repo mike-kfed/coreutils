@@ -10,121 +10,179 @@
 #[macro_use]
 extern crate uucore;
 
+use clap::{crate_version, Arg, Command};
 use libc::{c_char, dup2, execvp, signal};
 use libc::{SIGHUP, SIG_IGN};
 use std::env;
 use std::ffi::CString;
+use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::Error;
 use std::os::unix::prelude::*;
 use std::path::{Path, PathBuf};
-use uucore::fs::{is_stderr_interactive, is_stdin_interactive, is_stdout_interactive};
+use uucore::display::Quotable;
+use uucore::error::{set_exit_code, UError, UResult};
+use uucore::{format_usage, InvalidEncodingHandling};
 
-static NAME: &str = "nohup";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+static ABOUT: &str = "Run COMMAND ignoring hangup signals.";
+static LONG_HELP: &str = "
+If standard input is terminal, it'll be replaced with /dev/null.
+If standard output is terminal, it'll be appended to nohup.out instead,
+or $HOME/nohup.out, if nohup.out open failed.
+If standard error is terminal, it'll be redirected to stdout.
+";
+const USAGE: &str = "\
+    {} COMMAND [ARG]...
+    {} FLAG";
+static NOHUP_OUT: &str = "nohup.out";
+// exit codes that match the GNU implementation
+static EXIT_CANCELED: i32 = 125;
+static EXIT_CANNOT_INVOKE: i32 = 126;
+static EXIT_ENOENT: i32 = 127;
+static POSIX_NOHUP_FAILURE: i32 = 127;
 
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn _vprocmgr_detach_from_console(flags: u32) -> *const libc::c_int;
+mod options {
+    pub const CMD: &str = "cmd";
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-unsafe fn _vprocmgr_detach_from_console(_: u32) -> *const libc::c_int {
-    std::ptr::null()
+#[derive(Debug)]
+enum NohupError {
+    CannotDetach,
+    CannotReplace(&'static str, std::io::Error),
+    OpenFailed(i32, std::io::Error),
+    OpenFailed2(i32, std::io::Error, String, std::io::Error),
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+impl std::error::Error for NohupError {}
 
-    let mut opts = getopts::Options::new();
-
-    opts.optflag("h", "help", "Show help and exit");
-    opts.optflag("V", "version", "Show version and exit");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => {
-            show_error!("{}", f);
-            show_usage(&opts);
-            return 1;
+impl UError for NohupError {
+    fn code(&self) -> i32 {
+        match self {
+            Self::OpenFailed(code, _) | Self::OpenFailed2(code, _, _, _) => *code,
+            _ => 2,
         }
-    };
+    }
+}
 
-    if matches.opt_present("V") {
-        println!("{} {}", NAME, VERSION);
-        return 0;
+impl Display for NohupError {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            Self::CannotDetach => write!(f, "Cannot detach from console"),
+            Self::CannotReplace(s, e) => write!(f, "Cannot replace {}: {}", s, e),
+            Self::OpenFailed(_, e) => {
+                write!(f, "failed to open {}: {}", NOHUP_OUT.quote(), e)
+            }
+            NohupError::OpenFailed2(_, e1, s, e2) => write!(
+                f,
+                "failed to open {}: {}\nfailed to open {}: {}",
+                NOHUP_OUT.quote(),
+                e1,
+                s.quote(),
+                e2
+            ),
+        }
     }
-    if matches.opt_present("h") {
-        show_usage(&opts);
-        return 0;
-    }
+}
 
-    if matches.free.is_empty() {
-        show_error!("Missing operand: COMMAND");
-        println!("Try `{} --help` for more information.", NAME);
-        return 1;
-    }
-    replace_fds();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
+
+    let matches = uu_app().get_matches_from(args);
+
+    replace_fds()?;
 
     unsafe { signal(SIGHUP, SIG_IGN) };
 
     if unsafe { !_vprocmgr_detach_from_console(0).is_null() } {
-        crash!(2, "Cannot detach from console")
+        return Err(NohupError::CannotDetach.into());
     };
 
     let cstrs: Vec<CString> = matches
-        .free
-        .iter()
+        .values_of(options::CMD)
+        .unwrap()
         .map(|x| CString::new(x.as_bytes()).unwrap())
         .collect();
     let mut args: Vec<*const c_char> = cstrs.iter().map(|s| s.as_ptr()).collect();
     args.push(std::ptr::null());
-    unsafe { execvp(args[0], args.as_mut_ptr()) }
+
+    let ret = unsafe { execvp(args[0], args.as_mut_ptr()) };
+    match ret {
+        libc::ENOENT => set_exit_code(EXIT_ENOENT),
+        _ => set_exit_code(EXIT_CANNOT_INVOKE),
+    }
+    Ok(())
 }
 
-fn replace_fds() {
-    if is_stdin_interactive() {
-        let new_stdin = match File::open(Path::new("/dev/null")) {
-            Ok(t) => t,
-            Err(e) => crash!(2, "Cannot replace STDIN: {}", e),
-        };
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .after_help(LONG_HELP)
+        .override_usage(format_usage(USAGE))
+        .arg(
+            Arg::new(options::CMD)
+                .hide(true)
+                .required(true)
+                .multiple_occurrences(true),
+        )
+        .trailing_var_arg(true)
+        .infer_long_args(true)
+}
+
+fn replace_fds() -> UResult<()> {
+    if atty::is(atty::Stream::Stdin) {
+        let new_stdin = File::open(Path::new("/dev/null"))
+            .map_err(|e| NohupError::CannotReplace("STDIN", e))?;
         if unsafe { dup2(new_stdin.as_raw_fd(), 0) } != 0 {
-            crash!(2, "Cannot replace STDIN: {}", Error::last_os_error())
+            return Err(NohupError::CannotReplace("STDIN", Error::last_os_error()).into());
         }
     }
 
-    if is_stdout_interactive() {
-        let new_stdout = find_stdout();
+    if atty::is(atty::Stream::Stdout) {
+        let new_stdout = find_stdout()?;
         let fd = new_stdout.as_raw_fd();
 
         if unsafe { dup2(fd, 1) } != 1 {
-            crash!(2, "Cannot replace STDOUT: {}", Error::last_os_error())
+            return Err(NohupError::CannotReplace("STDOUT", Error::last_os_error()).into());
         }
     }
 
-    if is_stderr_interactive() && unsafe { dup2(1, 2) } != 2 {
-        crash!(2, "Cannot replace STDERR: {}", Error::last_os_error())
+    if atty::is(atty::Stream::Stderr) && unsafe { dup2(1, 2) } != 2 {
+        return Err(NohupError::CannotReplace("STDERR", Error::last_os_error()).into());
     }
+    Ok(())
 }
 
-fn find_stdout() -> File {
+fn find_stdout() -> UResult<File> {
+    let internal_failure_code = match std::env::var("POSIXLY_CORRECT") {
+        Ok(_) => POSIX_NOHUP_FAILURE,
+        Err(_) => EXIT_CANCELED,
+    };
+
     match OpenOptions::new()
         .write(true)
         .create(true)
         .append(true)
-        .open(Path::new("nohup.out"))
+        .open(Path::new(NOHUP_OUT))
     {
         Ok(t) => {
-            show_warning!("Output is redirected to: nohup.out");
-            t
+            show_error!(
+                "ignoring input and appending output to {}",
+                NOHUP_OUT.quote()
+            );
+            Ok(t)
         }
-        Err(e) => {
+        Err(e1) => {
             let home = match env::var("HOME") {
-                Err(_) => crash!(2, "Cannot replace STDOUT: {}", e),
+                Err(_) => return Err(NohupError::OpenFailed(internal_failure_code, e1).into()),
                 Ok(h) => h,
             };
             let mut homeout = PathBuf::from(home);
-            homeout.push("nohup.out");
+            homeout.push(NOHUP_OUT);
+            let homeout_str = homeout.to_str().unwrap();
             match OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -132,30 +190,30 @@ fn find_stdout() -> File {
                 .open(&homeout)
             {
                 Ok(t) => {
-                    show_warning!("Output is redirected to: {:?}", homeout);
-                    t
+                    show_error!(
+                        "ignoring input and appending output to {}",
+                        homeout_str.quote()
+                    );
+                    Ok(t)
                 }
-                Err(e) => crash!(2, "Cannot replace STDOUT: {}", e),
+                Err(e2) => Err(NohupError::OpenFailed2(
+                    internal_failure_code,
+                    e1,
+                    homeout_str.to_string(),
+                    e2,
+                )
+                .into()),
             }
         }
     }
 }
 
-fn show_usage(opts: &getopts::Options) {
-    let msg = format!(
-        "{0} {1}
+#[cfg(target_vendor = "apple")]
+extern "C" {
+    fn _vprocmgr_detach_from_console(flags: u32) -> *const libc::c_int;
+}
 
-Usage:
-  {0} COMMAND [ARG]...
-  {0} OPTION
-
-Run COMMAND ignoring hangup signals.
-If standard input is terminal, it'll be replaced with /dev/null.
-If standard output is terminal, it'll be appended to nohup.out instead,
-or $HOME/nohup.out, if nohup.out open failed.
-If standard error is terminal, it'll be redirected to stdout.",
-        NAME, VERSION
-    );
-
-    print!("{}", opts.usage(&msg));
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+unsafe fn _vprocmgr_detach_from_console(_: u32) -> *const libc::c_int {
+    std::ptr::null()
 }

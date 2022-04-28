@@ -3,24 +3,31 @@
 // (c) Jordi Boggiano <j.boggiano@seld.be>
 // (c) Evgeniy Klyuchikov <evgeniy.klyuchikov@gmail.com>
 // (c) Joshua S. Miller <jsmiller@uchicago.edu>
+// (c) Árni Dagur <arni@dagur.eu>
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
 // spell-checker:ignore (ToDO) nonprint nonblank nonprinting
 
-#[macro_use]
-extern crate quick_error;
 #[cfg(unix)]
 extern crate unix_socket;
-#[macro_use]
-extern crate uucore;
 
 // last synced with: cat (GNU coreutils) 8.13
-use quick_error::ResultExt;
+use clap::{crate_version, Arg, Command};
 use std::fs::{metadata, File};
-use std::io::{self, stderr, stdin, stdout, BufWriter, Read, Write};
-use uucore::fs::is_stdin_interactive;
+use std::io::{self, Read, Write};
+use thiserror::Error;
+use uucore::display::Quotable;
+use uucore::error::UResult;
+use uucore::fs::FileInformation;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+/// Linux splice support
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod splice;
 
 /// Unix domain socket support
 #[cfg(unix)]
@@ -29,50 +36,41 @@ use std::net::Shutdown;
 use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use unix_socket::UnixStream;
+use uucore::{format_usage, InvalidEncodingHandling};
 
-static SYNTAX: &str = "[OPTION]... [FILE]...";
+static NAME: &str = "cat";
+static USAGE: &str = "{} [OPTION]... [FILE]...";
 static SUMMARY: &str = "Concatenate FILE(s), or standard input, to standard output
  With no FILE, or when FILE is -, read standard input.";
-static LONG_HELP: &str = "";
+
+#[derive(Error, Debug)]
+enum CatError {
+    /// Wrapper around `io::Error`
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    /// Wrapper around `nix::Error`
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[error("{0}")]
+    Nix(#[from] nix::Error),
+    /// Unknown file type; it's not a regular file, socket, etc.
+    #[error("unknown filetype: {}", ft_debug)]
+    UnknownFiletype {
+        /// A debug print of the file type
+        ft_debug: String,
+    },
+    #[error("Is a directory")]
+    IsDirectory,
+    #[error("input file is output file")]
+    OutputIsInput,
+}
+
+type CatResult<T> = Result<T, CatError>;
 
 #[derive(PartialEq)]
 enum NumberingMode {
     None,
     NonEmpty,
     All,
-}
-
-quick_error! {
-    #[derive(Debug)]
-    enum CatError {
-        /// Wrapper for io::Error with path context
-        Input(err: io::Error, path: String) {
-            display("cat: {0}: {1}", path, err)
-            context(path: &'a str, err: io::Error) -> (err, path.to_owned())
-            cause(err)
-        }
-
-        /// Wrapper for io::Error with no context
-        Output(err: io::Error) {
-            display("cat: {0}", err) from()
-            cause(err)
-        }
-
-        /// Unknown Filetype  classification
-        UnknownFiletype(path: String) {
-            display("cat: {0}: unknown filetype", path)
-        }
-
-        /// At least one error was encountered in reading or writing
-        EncounteredErrors(count: usize) {
-            display("cat: encountered {0} errors", count)
-        }
-
-        /// Denotes an error caused by trying to `cat` a directory
-        IsDirectory(path: String) {
-            display("cat: {0}: Is a directory", path)
-        }
-    }
 }
 
 struct OutputOptions {
@@ -85,21 +83,70 @@ struct OutputOptions {
     /// display TAB characters as `tab`
     show_tabs: bool,
 
-    /// If `show_tabs == true`, this string will be printed in the
-    /// place of tabs
-    tab: String,
-
-    /// Can be set to show characters other than '\n' a the end of
-    /// each line, e.g. $
-    end_of_line: String,
+    /// Show end of lines
+    show_ends: bool,
 
     /// use ^ and M- notation, except for LF (\\n) and TAB (\\t)
     show_nonprint: bool,
 }
 
+impl OutputOptions {
+    fn tab(&self) -> &'static str {
+        if self.show_tabs {
+            "^I"
+        } else {
+            "\t"
+        }
+    }
+
+    fn end_of_line(&self) -> &'static str {
+        if self.show_ends {
+            "$\n"
+        } else {
+            "\n"
+        }
+    }
+
+    /// We can write fast if we can simply copy the contents of the file to
+    /// stdout, without augmenting the output with e.g. line numbers.
+    fn can_write_fast(&self) -> bool {
+        !(self.show_tabs
+            || self.show_nonprint
+            || self.show_ends
+            || self.squeeze_blank
+            || self.number != NumberingMode::None)
+    }
+}
+
+/// State that persists between output of each file. This struct is only used
+/// when we can't write fast.
+struct OutputState {
+    /// The current line number
+    line_number: usize,
+
+    /// Whether the output cursor is at the beginning of a new line
+    at_line_start: bool,
+
+    /// Whether we skipped a \r, which still needs to be printed
+    skipped_carriage_return: bool,
+
+    /// Whether we have already printed a blank line
+    one_blank_kept: bool,
+}
+
+#[cfg(unix)]
+trait FdReadable: Read + AsRawFd {}
+#[cfg(not(unix))]
+trait FdReadable: Read {}
+
+#[cfg(unix)]
+impl<T> FdReadable for T where T: Read + AsRawFd {}
+#[cfg(not(unix))]
+impl<T> FdReadable for T where T: Read {}
+
 /// Represents an open file handle, stream, or other device
-struct InputHandle {
-    reader: Box<dyn Read>,
+struct InputHandle<R: FdReadable> {
+    reader: R,
     is_interactive: bool,
 }
 
@@ -122,82 +169,231 @@ enum InputType {
     Socket,
 }
 
-type CatResult<T> = Result<T, CatError>;
+mod options {
+    pub static FILE: &str = "file";
+    pub static SHOW_ALL: &str = "show-all";
+    pub static NUMBER_NONBLANK: &str = "number-nonblank";
+    pub static SHOW_NONPRINTING_ENDS: &str = "e";
+    pub static SHOW_ENDS: &str = "show-ends";
+    pub static NUMBER: &str = "number";
+    pub static SQUEEZE_BLANK: &str = "squeeze-blank";
+    pub static SHOW_NONPRINTING_TABS: &str = "t";
+    pub static SHOW_TABS: &str = "show-tabs";
+    pub static SHOW_NONPRINTING: &str = "show-nonprinting";
+}
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::Ignore)
+        .accept_any();
 
-    let matches = app!(SYNTAX, SUMMARY, LONG_HELP)
-        .optflag("A", "show-all", "equivalent to -vET")
-        .optflag(
-            "b",
-            "number-nonblank",
-            "number nonempty output lines, overrides -n",
-        )
-        .optflag("e", "", "equivalent to -vE")
-        .optflag("E", "show-ends", "display $ at end of each line")
-        .optflag("n", "number", "number all output lines")
-        .optflag("s", "squeeze-blank", "suppress repeated empty output lines")
-        .optflag("t", "", "equivalent to -vT")
-        .optflag("T", "show-tabs", "display TAB characters as ^I")
-        .optflag(
-            "v",
-            "show-nonprinting",
-            "use ^ and M- notation, except for LF (\\n) and TAB (\\t)",
-        )
-        .parse(args);
+    let matches = uu_app().get_matches_from(args);
 
-    let number_mode = if matches.opt_present("b") {
+    let number_mode = if matches.is_present(options::NUMBER_NONBLANK) {
         NumberingMode::NonEmpty
-    } else if matches.opt_present("n") {
+    } else if matches.is_present(options::NUMBER) {
         NumberingMode::All
     } else {
         NumberingMode::None
     };
 
-    let show_nonprint = matches.opts_present(&[
-        "A".to_owned(),
-        "e".to_owned(),
-        "t".to_owned(),
-        "v".to_owned(),
-    ]);
-    let show_ends = matches.opts_present(&["E".to_owned(), "A".to_owned(), "e".to_owned()]);
-    let show_tabs = matches.opts_present(&["A".to_owned(), "T".to_owned(), "t".to_owned()]);
-    let squeeze_blank = matches.opt_present("s");
-    let mut files = matches.free;
-    if files.is_empty() {
-        files.push("-".to_owned());
-    }
+    let show_nonprint = vec![
+        options::SHOW_ALL.to_owned(),
+        options::SHOW_NONPRINTING_ENDS.to_owned(),
+        options::SHOW_NONPRINTING_TABS.to_owned(),
+        options::SHOW_NONPRINTING.to_owned(),
+    ]
+    .iter()
+    .any(|v| matches.is_present(v));
 
-    let can_write_fast = !(show_tabs
-        || show_nonprint
-        || show_ends
-        || squeeze_blank
-        || number_mode != NumberingMode::None);
+    let show_ends = vec![
+        options::SHOW_ENDS.to_owned(),
+        options::SHOW_ALL.to_owned(),
+        options::SHOW_NONPRINTING_ENDS.to_owned(),
+    ]
+    .iter()
+    .any(|v| matches.is_present(v));
 
-    let success = if can_write_fast {
-        write_fast(files).is_ok()
-    } else {
-        let tab = if show_tabs { "^I" } else { "\t" }.to_owned();
+    let show_tabs = vec![
+        options::SHOW_ALL.to_owned(),
+        options::SHOW_TABS.to_owned(),
+        options::SHOW_NONPRINTING_TABS.to_owned(),
+    ]
+    .iter()
+    .any(|v| matches.is_present(v));
 
-        let end_of_line = if show_ends { "$\n" } else { "\n" }.to_owned();
-
-        let options = OutputOptions {
-            end_of_line,
-            number: number_mode,
-            show_nonprint,
-            show_tabs,
-            squeeze_blank,
-            tab,
-        };
-
-        write_lines(files, &options).is_ok()
+    let squeeze_blank = matches.is_present(options::SQUEEZE_BLANK);
+    let files: Vec<String> = match matches.values_of(options::FILE) {
+        Some(v) => v.clone().map(|v| v.to_owned()).collect(),
+        None => vec!["-".to_owned()],
     };
 
-    if success {
-        0
+    let options = OutputOptions {
+        show_ends,
+        number: number_mode,
+        show_nonprint,
+        show_tabs,
+        squeeze_blank,
+    };
+    cat_files(&files, &options)
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .name(NAME)
+        .version(crate_version!())
+        .override_usage(format_usage(USAGE))
+        .about(SUMMARY)
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::FILE)
+                .hide(true)
+                .multiple_occurrences(true),
+        )
+        .arg(
+            Arg::new(options::SHOW_ALL)
+                .short('A')
+                .long(options::SHOW_ALL)
+                .help("equivalent to -vET"),
+        )
+        .arg(
+            Arg::new(options::NUMBER_NONBLANK)
+                .short('b')
+                .long(options::NUMBER_NONBLANK)
+                .help("number nonempty output lines, overrides -n")
+                .overrides_with(options::NUMBER),
+        )
+        .arg(
+            Arg::new(options::SHOW_NONPRINTING_ENDS)
+                .short('e')
+                .help("equivalent to -vE"),
+        )
+        .arg(
+            Arg::new(options::SHOW_ENDS)
+                .short('E')
+                .long(options::SHOW_ENDS)
+                .help("display $ at end of each line"),
+        )
+        .arg(
+            Arg::new(options::NUMBER)
+                .short('n')
+                .long(options::NUMBER)
+                .help("number all output lines"),
+        )
+        .arg(
+            Arg::new(options::SQUEEZE_BLANK)
+                .short('s')
+                .long(options::SQUEEZE_BLANK)
+                .help("suppress repeated empty output lines"),
+        )
+        .arg(
+            Arg::new(options::SHOW_NONPRINTING_TABS)
+                .short('t')
+                .long(options::SHOW_NONPRINTING_TABS)
+                .help("equivalent to -vT"),
+        )
+        .arg(
+            Arg::new(options::SHOW_TABS)
+                .short('T')
+                .long(options::SHOW_TABS)
+                .help("display TAB characters at ^I"),
+        )
+        .arg(
+            Arg::new(options::SHOW_NONPRINTING)
+                .short('v')
+                .long(options::SHOW_NONPRINTING)
+                .help("use ^ and M- notation, except for LF (\\n) and TAB (\\t)"),
+        )
+}
+
+fn cat_handle<R: FdReadable>(
+    handle: &mut InputHandle<R>,
+    options: &OutputOptions,
+    state: &mut OutputState,
+) -> CatResult<()> {
+    if options.can_write_fast() {
+        write_fast(handle)
     } else {
-        1
+        write_lines(handle, options, state)
+    }
+}
+
+fn cat_path(
+    path: &str,
+    options: &OutputOptions,
+    state: &mut OutputState,
+    out_info: Option<&FileInformation>,
+) -> CatResult<()> {
+    match get_input_type(path)? {
+        InputType::StdIn => {
+            let stdin = io::stdin();
+            let mut handle = InputHandle {
+                reader: stdin,
+                is_interactive: atty::is(atty::Stream::Stdin),
+            };
+            cat_handle(&mut handle, options, state)
+        }
+        InputType::Directory => Err(CatError::IsDirectory),
+        #[cfg(unix)]
+        InputType::Socket => {
+            let socket = UnixStream::connect(path)?;
+            socket.shutdown(Shutdown::Write)?;
+            let mut handle = InputHandle {
+                reader: socket,
+                is_interactive: false,
+            };
+            cat_handle(&mut handle, options, state)
+        }
+        _ => {
+            let file = File::open(path)?;
+
+            if let Some(out_info) = out_info {
+                if out_info.file_size() != 0
+                    && FileInformation::from_file(&file).as_ref() == Some(out_info)
+                {
+                    return Err(CatError::OutputIsInput);
+                }
+            }
+
+            let mut handle = InputHandle {
+                reader: file,
+                is_interactive: false,
+            };
+            cat_handle(&mut handle, options, state)
+        }
+    }
+}
+
+fn cat_files(files: &[String], options: &OutputOptions) -> UResult<()> {
+    let out_info = FileInformation::from_file(&std::io::stdout());
+
+    let mut state = OutputState {
+        line_number: 1,
+        at_line_start: true,
+        skipped_carriage_return: false,
+        one_blank_kept: false,
+    };
+    let mut error_messages: Vec<String> = Vec::new();
+
+    for path in files {
+        if let Err(err) = cat_path(path, options, &mut state, out_info.as_ref()) {
+            error_messages.push(format!("{}: {}", path.maybe_quote(), err));
+        }
+    }
+    if state.skipped_carriage_return {
+        print!("\r");
+    }
+    if error_messages.is_empty() {
+        Ok(())
+    } else {
+        // each next line is expected to display "cat: …"
+        let line_joiner = format!("\n{}: ", uucore::util_name());
+
+        Err(uucore::error::USimpleError::new(
+            error_messages.len() as i32,
+            error_messages.join(&line_joiner),
+        ))
     }
 }
 
@@ -211,7 +407,8 @@ fn get_input_type(path: &str) -> CatResult<InputType> {
         return Ok(InputType::StdIn);
     }
 
-    match metadata(path).context(path)?.file_type() {
+    let ft = metadata(path)?.file_type();
+    match ft {
         #[cfg(unix)]
         ft if ft.is_block_device() => Ok(InputType::BlockDevice),
         #[cfg(unix)]
@@ -223,126 +420,47 @@ fn get_input_type(path: &str) -> CatResult<InputType> {
         ft if ft.is_dir() => Ok(InputType::Directory),
         ft if ft.is_file() => Ok(InputType::File),
         ft if ft.is_symlink() => Ok(InputType::SymLink),
-        _ => Err(CatError::UnknownFiletype(path.to_owned())),
+        _ => Err(CatError::UnknownFiletype {
+            ft_debug: format!("{:?}", ft),
+        }),
     }
 }
 
-/// Returns an InputHandle from which a Reader can be accessed or an
-/// error
-///
-/// # Arguments
-///
-/// * `path` - `InputHandler` will wrap a reader from this file path
-fn open(path: &str) -> CatResult<InputHandle> {
-    if path == "-" {
-        let stdin = stdin();
-        return Ok(InputHandle {
-            reader: Box::new(stdin) as Box<dyn Read>,
-            is_interactive: is_stdin_interactive(),
-        });
-    }
-
-    match get_input_type(path)? {
-        InputType::Directory => Err(CatError::IsDirectory(path.to_owned())),
-        #[cfg(unix)]
-        InputType::Socket => {
-            let socket = UnixStream::connect(path).context(path)?;
-            socket.shutdown(Shutdown::Write).context(path)?;
-            Ok(InputHandle {
-                reader: Box::new(socket) as Box<dyn Read>,
-                is_interactive: false,
-            })
-        }
-        _ => {
-            let file = File::open(path).context(path)?;
-            Ok(InputHandle {
-                reader: Box::new(file) as Box<dyn Read>,
-                is_interactive: false,
-            })
+/// Writes handle to stdout with no configuration. This allows a
+/// simple memory copy.
+fn write_fast<R: FdReadable>(handle: &mut InputHandle<R>) -> CatResult<()> {
+    let stdout = io::stdout();
+    let mut stdout_lock = stdout.lock();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // If we're on Linux or Android, try to use the splice() system call
+        // for faster writing. If it works, we're done.
+        if !splice::write_fast_using_splice(handle, &stdout_lock)? {
+            return Ok(());
         }
     }
-}
-
-/// Writes files to stdout with no configuration.  This allows a
-/// simple memory copy. Returns `Ok(())` if no errors were
-/// encountered, or an error with the number of errors encountered.
-///
-/// # Arguments
-///
-/// * `files` - There is no short circuit when encountering an error
-/// reading a file in this vector
-fn write_fast(files: Vec<String>) -> CatResult<()> {
-    let mut writer = stdout();
-    let mut in_buf = [0; 1024 * 64];
-    let mut error_count = 0;
-
-    for file in files {
-        match open(&file[..]) {
-            Ok(mut handle) => {
-                while let Ok(n) = handle.reader.read(&mut in_buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    writer.write_all(&in_buf[..n]).context(&file[..])?;
-                }
-            }
-            Err(error) => {
-                writeln!(&mut stderr(), "{}", error)?;
-                error_count += 1;
-            }
+    // If we're not on Linux or Android, or the splice() call failed,
+    // fall back on slower writing.
+    let mut buf = [0; 1024 * 64];
+    while let Ok(n) = handle.reader.read(&mut buf) {
+        if n == 0 {
+            break;
         }
+        stdout_lock.write_all(&buf[..n])?;
     }
-
-    match error_count {
-        0 => Ok(()),
-        _ => Err(CatError::EncounteredErrors(error_count)),
-    }
-}
-
-/// State that persists between output of each file
-struct OutputState {
-    /// The current line number
-    line_number: usize,
-
-    /// Whether the output cursor is at the beginning of a new line
-    at_line_start: bool,
-}
-
-/// Writes files to stdout with `options` as configuration.  Returns
-/// `Ok(())` if no errors were encountered, or an error with the
-/// number of errors encountered.
-///
-/// # Arguments
-///
-/// * `files` - There is no short circuit when encountering an error
-/// reading a file in this vector
-fn write_lines(files: Vec<String>, options: &OutputOptions) -> CatResult<()> {
-    let mut error_count = 0;
-    let mut state = OutputState {
-        line_number: 1,
-        at_line_start: true,
-    };
-
-    for file in files {
-        if let Err(error) = write_file_lines(&file, options, &mut state) {
-            writeln!(&mut stderr(), "{}", error).context(&file[..])?;
-            error_count += 1;
-        }
-    }
-
-    match error_count {
-        0 => Ok(()),
-        _ => Err(CatError::EncounteredErrors(error_count)),
-    }
+    Ok(())
 }
 
 /// Outputs file contents to stdout in a line-by-line fashion,
 /// propagating any errors that might occur.
-fn write_file_lines(file: &str, options: &OutputOptions, state: &mut OutputState) -> CatResult<()> {
-    let mut handle = open(file)?;
+fn write_lines<R: FdReadable>(
+    handle: &mut InputHandle<R>,
+    options: &OutputOptions,
+    state: &mut OutputState,
+) -> CatResult<()> {
     let mut in_buf = [0; 1024 * 31];
-    let mut writer = BufWriter::with_capacity(1024 * 64, stdout());
-    let mut one_blank_kept = false;
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
 
     while let Ok(n) = handle.reader.read(&mut in_buf) {
         if n == 0 {
@@ -353,47 +471,62 @@ fn write_file_lines(file: &str, options: &OutputOptions, state: &mut OutputState
         while pos < n {
             // skip empty line_number enumerating them if needed
             if in_buf[pos] == b'\n' {
-                if !state.at_line_start || !options.squeeze_blank || !one_blank_kept {
-                    one_blank_kept = true;
+                // \r followed by \n is printed as ^M when show_ends is enabled, so that \r\n prints as ^M$
+                if state.skipped_carriage_return && options.show_ends {
+                    writer.write_all(b"^M")?;
+                    state.skipped_carriage_return = false;
+                }
+                if !state.at_line_start || !options.squeeze_blank || !state.one_blank_kept {
+                    state.one_blank_kept = true;
                     if state.at_line_start && options.number == NumberingMode::All {
-                        write!(&mut writer, "{0:6}\t", state.line_number)?;
+                        write!(writer, "{0:6}\t", state.line_number)?;
                         state.line_number += 1;
                     }
-                    writer.write_all(options.end_of_line.as_bytes())?;
+                    writer.write_all(options.end_of_line().as_bytes())?;
                     if handle.is_interactive {
-                        writer.flush().context(&file[..])?;
+                        writer.flush()?;
                     }
                 }
                 state.at_line_start = true;
                 pos += 1;
                 continue;
             }
-            one_blank_kept = false;
+            if state.skipped_carriage_return {
+                writer.write_all(b"\r")?;
+                state.skipped_carriage_return = false;
+                state.at_line_start = false;
+            }
+            state.one_blank_kept = false;
             if state.at_line_start && options.number != NumberingMode::None {
-                write!(&mut writer, "{0:6}\t", state.line_number)?;
+                write!(writer, "{0:6}\t", state.line_number)?;
                 state.line_number += 1;
             }
 
             // print to end of line or end of buffer
             let offset = if options.show_nonprint {
-                write_nonprint_to_end(&in_buf[pos..], &mut writer, options.tab.as_bytes())
+                write_nonprint_to_end(&in_buf[pos..], &mut writer, options.tab().as_bytes())
             } else if options.show_tabs {
                 write_tab_to_end(&in_buf[pos..], &mut writer)
             } else {
                 write_to_end(&in_buf[pos..], &mut writer)
             };
             // end of buffer?
-            if offset == 0 {
+            if offset + pos == in_buf.len() {
                 state.at_line_start = false;
                 break;
             }
-            // print suitable end of line
-            writer.write_all(options.end_of_line.as_bytes())?;
-            if handle.is_interactive {
-                writer.flush()?;
+            if in_buf[pos + offset] == b'\r' {
+                state.skipped_carriage_return = true;
+            } else {
+                assert_eq!(in_buf[pos + offset], b'\n');
+                // print suitable end of line
+                writer.write_all(options.end_of_line().as_bytes())?;
+                if handle.is_interactive {
+                    writer.flush()?;
+                }
+                state.at_line_start = true;
             }
-            state.at_line_start = true;
-            pos += offset;
+            pos += offset + 1;
         }
     }
 
@@ -401,17 +534,19 @@ fn write_file_lines(file: &str, options: &OutputOptions, state: &mut OutputState
 }
 
 // write***_to_end methods
-// Write all symbols till end of line or end of buffer is reached
-// Return the (number of written symbols + 1) or 0 if the end of buffer is reached
+// Write all symbols till \n or \r or end of buffer is reached
+// We need to stop at \r because it may be written as ^M depending on the byte after and settings;
+// however, write_nonprint_to_end doesn't need to stop at \r because it will always write \r as ^M.
+// Return the number of written symbols
 fn write_to_end<W: Write>(in_buf: &[u8], writer: &mut W) -> usize {
-    match in_buf.iter().position(|c| *c == b'\n') {
+    match in_buf.iter().position(|c| *c == b'\n' || *c == b'\r') {
         Some(p) => {
             writer.write_all(&in_buf[..p]).unwrap();
-            p + 1
+            p
         }
         None => {
             writer.write_all(in_buf).unwrap();
-            0
+            in_buf.len()
         }
     }
 }
@@ -419,20 +554,24 @@ fn write_to_end<W: Write>(in_buf: &[u8], writer: &mut W) -> usize {
 fn write_tab_to_end<W: Write>(mut in_buf: &[u8], writer: &mut W) -> usize {
     let mut count = 0;
     loop {
-        match in_buf.iter().position(|c| *c == b'\n' || *c == b'\t') {
+        match in_buf
+            .iter()
+            .position(|c| *c == b'\n' || *c == b'\t' || *c == b'\r')
+        {
             Some(p) => {
                 writer.write_all(&in_buf[..p]).unwrap();
-                if in_buf[p] == b'\n' {
-                    return count + p + 1;
-                } else {
+                if in_buf[p] == b'\t' {
                     writer.write_all(b"^I").unwrap();
                     in_buf = &in_buf[p + 1..];
                     count += p + 1;
+                } else {
+                    // b'\n' or b'\r'
+                    return count + p;
                 }
             }
             None => {
                 writer.write_all(in_buf).unwrap();
-                return 0;
+                return in_buf.len();
             }
         };
     }
@@ -441,7 +580,7 @@ fn write_tab_to_end<W: Write>(mut in_buf: &[u8], writer: &mut W) -> usize {
 fn write_nonprint_to_end<W: Write>(in_buf: &[u8], writer: &mut W, tab: &[u8]) -> usize {
     let mut count = 0;
 
-    for byte in in_buf.iter().map(|c| *c) {
+    for byte in in_buf.iter().copied() {
         if byte == b'\n' {
             break;
         }
@@ -449,19 +588,15 @@ fn write_nonprint_to_end<W: Write>(in_buf: &[u8], writer: &mut W, tab: &[u8]) ->
             9 => writer.write_all(tab),
             0..=8 | 10..=31 => writer.write_all(&[b'^', byte + 64]),
             32..=126 => writer.write_all(&[byte]),
-            127 => writer.write_all(&[b'^', byte - 64]),
+            127 => writer.write_all(&[b'^', b'?']),
             128..=159 => writer.write_all(&[b'M', b'-', b'^', byte - 64]),
             160..=254 => writer.write_all(&[b'M', b'-', byte - 128]),
-            _ => writer.write_all(&[b'M', b'-', b'^', 63]),
+            _ => writer.write_all(&[b'M', b'-', b'^', b'?']),
         }
         .unwrap();
         count += 1;
     }
-    if count != in_buf.len() {
-        count + 1
-    } else {
-        0
-    }
+    count
 }
 
 #[cfg(test)]

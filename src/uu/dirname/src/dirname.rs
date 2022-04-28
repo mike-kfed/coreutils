@@ -5,42 +5,58 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, Arg, Command};
 use std::path::Path;
+use uucore::display::print_verbatim;
+use uucore::error::{UResult, UUsageError};
+use uucore::{format_usage, InvalidEncodingHandling};
 
-static NAME: &str = "dirname";
-static SYNTAX: &str = "[OPTION] NAME...";
-static SUMMARY: &str = "strip last component from file name";
-static LONG_HELP: &str = "
- Output each NAME with its last non-slash component and trailing slashes
- removed; if NAME contains no /'s, output '.' (meaning the current
- directory).
-";
+static ABOUT: &str = "strip last component from file name";
+const USAGE: &str = "{} [OPTION] NAME...";
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+mod options {
+    pub const ZERO: &str = "zero";
+    pub const DIR: &str = "dir";
+}
 
-    let matches = app!(SYNTAX, SUMMARY, LONG_HELP)
-        .optflag("z", "zero", "separate output with NUL rather than newline")
-        .parse(args);
+fn get_long_usage() -> String {
+    String::from(
+        "Output each NAME with its last non-slash component and trailing slashes
+        removed; if NAME contains no /'s, output '.' (meaning the current directory).",
+    )
+}
 
-    let separator = if matches.opt_present("zero") {
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
+
+    let after_help = get_long_usage();
+
+    let matches = uu_app().after_help(&after_help[..]).get_matches_from(args);
+
+    let separator = if matches.is_present(options::ZERO) {
         "\0"
     } else {
         "\n"
     };
 
-    if !matches.free.is_empty() {
-        for path in &matches.free {
+    let dirnames: Vec<String> = matches
+        .values_of(options::DIR)
+        .unwrap_or_default()
+        .map(str::to_owned)
+        .collect();
+
+    if !dirnames.is_empty() {
+        for path in &dirnames {
             let p = Path::new(path);
             match p.parent() {
                 Some(d) => {
                     if d.components().next() == None {
-                        print!(".")
+                        print!(".");
                     } else {
-                        print!("{}", d.to_string_lossy());
+                        print_verbatim(d).unwrap();
                     }
                 }
                 None => {
@@ -54,10 +70,23 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             print!("{}", separator);
         }
     } else {
-        println!("{0}: missing operand", NAME);
-        println!("Try '{0} --help' for more information.", NAME);
-        return 1;
+        return Err(UUsageError::new(1, "missing operand"));
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .about(ABOUT)
+        .version(crate_version!())
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::ZERO)
+                .long(options::ZERO)
+                .short('z')
+                .help("separate output with NUL rather than newline"),
+        )
+        .arg(Arg::new(options::DIR).hide(true).multiple_occurrences(true))
 }

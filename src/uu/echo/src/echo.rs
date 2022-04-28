@@ -6,17 +6,19 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, Arg, Command};
 use std::io::{self, Write};
 use std::iter::Peekable;
 use std::str::Chars;
+use uucore::error::{FromIo, UResult};
+use uucore::{format_usage, InvalidEncodingHandling};
 
-const SYNTAX: &str = "[OPTIONS]... [STRING]...";
+const NAME: &str = "echo";
 const SUMMARY: &str = "display a line of text";
-const HELP: &str = r#"
+const USAGE: &str = "{} [OPTIONS]... [STRING]...";
+const AFTER_HELP: &str = r#"
  Echo the STRING(s) to standard output.
+
  If -e is in effect, the following sequences are recognized:
 
  \\\\      backslash
@@ -32,6 +34,13 @@ const HELP: &str = r#"
  \\0NNN   byte with octal value NNN (1 to 3 digits)
  \\xHH    byte with hexadecimal value HH (1 to 2 digits)
 "#;
+
+mod options {
+    pub const STRING: &str = "STRING";
+    pub const NO_NEWLINE: &str = "no_newline";
+    pub const ENABLE_BACKSLASH_ESCAPE: &str = "enable_backslash_escape";
+    pub const DISABLE_BACKSLASH_ESCAPE: &str = "disable_backslash_escape";
+}
 
 fn parse_code(
     input: &mut Peekable<Chars>,
@@ -79,10 +88,7 @@ fn print_escaped(input: &str, mut output: impl Write) -> io::Result<bool> {
                         start = 0;
                         next
                     }),
-                    '0' => parse_code(&mut iter, 8, 3, 3).unwrap_or_else(|| {
-                        start = 0;
-                        next
-                    }),
+                    '0' => parse_code(&mut iter, 8, 3, 3).unwrap_or('\0'),
                     _ => {
                         start = 0;
                         next
@@ -102,32 +108,59 @@ fn print_escaped(input: &str, mut output: impl Write) -> io::Result<bool> {
     Ok(should_stop)
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
+    let matches = uu_app().get_matches_from(args);
 
-    let matches = app!(SYNTAX, SUMMARY, HELP)
-        .optflag("n", "", "do not output the trailing newline")
-        .optflag("e", "", "enable interpretation of backslash escapes")
-        .optflag(
-            "E",
-            "",
-            "disable interpretation of backslash escapes (default)",
-        )
-        .parse(args);
+    let no_newline = matches.is_present(options::NO_NEWLINE);
+    let escaped = matches.is_present(options::ENABLE_BACKSLASH_ESCAPE);
+    let values: Vec<String> = match matches.values_of(options::STRING) {
+        Some(s) => s.map(|s| s.to_string()).collect(),
+        None => vec!["".to_string()],
+    };
 
-    let no_newline = matches.opt_present("n");
-    let escaped = matches.opt_present("e");
-
-    match execute(no_newline, escaped, matches.free) {
-        Ok(_) => 0,
-        Err(f) => {
-            show_error!("{}", f);
-            1
-        }
-    }
+    execute(no_newline, escaped, &values)
+        .map_err_context(|| "could not write to stdout".to_string())
 }
 
-fn execute(no_newline: bool, escaped: bool, free: Vec<String>) -> io::Result<()> {
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .name(NAME)
+        // TrailingVarArg specifies the final positional argument is a VarArg
+        // and it doesn't attempts the parse any further args.
+        // Final argument must have multiple(true) or the usage string equivalent.
+        .trailing_var_arg(true)
+        .allow_hyphen_values(true)
+        .infer_long_args(true)
+        .version(crate_version!())
+        .about(SUMMARY)
+        .after_help(AFTER_HELP)
+        .override_usage(format_usage(USAGE))
+        .arg(
+            Arg::new(options::NO_NEWLINE)
+                .short('n')
+                .help("do not output the trailing newline")
+                .takes_value(false),
+        )
+        .arg(
+            Arg::new(options::ENABLE_BACKSLASH_ESCAPE)
+                .short('e')
+                .help("enable interpretation of backslash escapes")
+                .takes_value(false),
+        )
+        .arg(
+            Arg::new(options::DISABLE_BACKSLASH_ESCAPE)
+                .short('E')
+                .help("disable interpretation of backslash escapes (default)")
+                .takes_value(false),
+        )
+        .arg(Arg::new(options::STRING).multiple_occurrences(true))
+}
+
+fn execute(no_newline: bool, escaped: bool, free: &[String]) -> io::Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -136,7 +169,7 @@ fn execute(no_newline: bool, escaped: bool, free: Vec<String>) -> io::Result<()>
             write!(output, " ")?;
         }
         if escaped {
-            let should_stop = print_escaped(&input, &mut output)?;
+            let should_stop = print_escaped(input, &mut output)?;
             if should_stop {
                 break;
             }

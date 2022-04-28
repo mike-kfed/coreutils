@@ -8,20 +8,18 @@
 
 // spell-checker:ignore (ToDO) corasick memchr
 
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, Arg, Command};
 use std::fs::File;
 use std::io::{stdin, BufRead, BufReader, Read};
 use std::iter::repeat;
 use std::path::Path;
+use uucore::error::{FromIo, UResult, USimpleError};
+use uucore::{format_usage, InvalidEncodingHandling};
 
 mod helper;
 
 static NAME: &str = "nl";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
-static USAGE: &str = "nl [OPTION]... [FILE]...";
-// A regular expression matching everything.
+static USAGE: &str = "{} [OPTION]... [FILE]...";
 
 // Settings store options used by nl to produce its output.
 pub struct Settings {
@@ -67,78 +65,29 @@ enum NumberFormat {
     RightZero,
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+pub mod options {
+    pub const HELP: &str = "help";
+    pub const FILE: &str = "file";
+    pub const BODY_NUMBERING: &str = "body-numbering";
+    pub const SECTION_DELIMITER: &str = "section-delimiter";
+    pub const FOOTER_NUMBERING: &str = "footer-numbering";
+    pub const HEADER_NUMBERING: &str = "header-numbering";
+    pub const LINE_INCREMENT: &str = "line-increment";
+    pub const JOIN_BLANK_LINES: &str = "join-blank-lines";
+    pub const NUMBER_FORMAT: &str = "number-format";
+    pub const NO_RENUMBER: &str = "no-renumber";
+    pub const NUMBER_SEPARATOR: &str = "number-separator";
+    pub const STARTING_LINE_NUMBER: &str = "starting-line-number";
+    pub const NUMBER_WIDTH: &str = "number-width";
+}
 
-    let mut opts = getopts::Options::new();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
 
-    opts.optopt(
-        "b",
-        "body-numbering",
-        "use STYLE for numbering body lines",
-        "STYLE",
-    );
-    opts.optopt(
-        "d",
-        "section-delimiter",
-        "use CC for separating logical pages",
-        "CC",
-    );
-    opts.optopt(
-        "f",
-        "footer-numbering",
-        "use STYLE for numbering footer lines",
-        "STYLE",
-    );
-    opts.optopt(
-        "h",
-        "header-numbering",
-        "use STYLE for numbering header lines",
-        "STYLE",
-    );
-    opts.optopt(
-        "i",
-        "line-increment",
-        "line number increment at each line",
-        "",
-    );
-    opts.optopt(
-        "l",
-        "join-blank-lines",
-        "group of NUMBER empty lines counted as one",
-        "NUMBER",
-    );
-    opts.optopt(
-        "n",
-        "number-format",
-        "insert line numbers according to FORMAT",
-        "FORMAT",
-    );
-    opts.optflag(
-        "p",
-        "no-renumber",
-        "do not reset line numbers at logical pages",
-    );
-    opts.optopt(
-        "s",
-        "number-separator",
-        "add STRING after (possible) line number",
-        "STRING",
-    );
-    opts.optopt(
-        "v",
-        "starting-line-number",
-        "first line number on each logical page",
-        "NUMBER",
-    );
-    opts.optopt(
-        "w",
-        "number-width",
-        "use NUMBER columns for line numbers",
-        "NUMBER",
-    );
-    opts.optflag("", "help", "display this help and exit");
-    opts.optflag("V", "version", "version");
+    let matches = uu_app().get_matches_from(args);
 
     // A mutable settings object, initialized with the defaults.
     let mut settings = Settings {
@@ -155,37 +104,21 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         number_separator: String::from("\t"),
     };
 
-    let given_options = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => {
-            show_error!("{}", f);
-            print_usage(&opts);
-            return 1;
-        }
-    };
-
-    if given_options.opt_present("help") {
-        print_usage(&opts);
-        return 0;
-    }
-    if given_options.opt_present("version") {
-        version();
-        return 0;
-    }
-
     // Update the settings from the command line options, and terminate the
     // program if some options could not successfully be parsed.
-    let parse_errors = helper::parse_options(&mut settings, &given_options);
+    let parse_errors = helper::parse_options(&mut settings, &matches);
     if !parse_errors.is_empty() {
-        show_error!("Invalid arguments supplied.");
-        for message in &parse_errors {
-            println!("{}", message);
-        }
-        return 1;
+        return Err(USimpleError::new(
+            1,
+            format!("Invalid arguments supplied.\n{}", parse_errors.join("\n")),
+        ));
     }
 
-    let files = given_options.free;
-    let mut read_stdin = files.is_empty();
+    let mut read_stdin = false;
+    let files: Vec<String> = match matches.values_of(options::FILE) {
+        Some(v) => v.clone().map(|v| v.to_owned()).collect(),
+        None => vec!["-".to_owned()],
+    };
 
     for file in &files {
         if file == "-" {
@@ -195,20 +128,114 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             continue;
         }
         let path = Path::new(file);
-        let reader = File::open(path).unwrap();
+        let reader = File::open(path).map_err_context(|| file.to_string())?;
         let mut buffer = BufReader::new(reader);
-        nl(&mut buffer, &settings);
+        nl(&mut buffer, &settings)?;
     }
 
     if read_stdin {
         let mut buffer = BufReader::new(stdin());
-        nl(&mut buffer, &settings);
+        nl(&mut buffer, &settings)?;
     }
-    0
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .name(NAME)
+        .version(crate_version!())
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::HELP)
+                .long(options::HELP)
+                .help("Print help information."),
+        )
+        .arg(
+            Arg::new(options::FILE)
+                .hide(true)
+                .multiple_occurrences(true),
+        )
+        .arg(
+            Arg::new(options::BODY_NUMBERING)
+                .short('b')
+                .long(options::BODY_NUMBERING)
+                .help("use STYLE for numbering body lines")
+                .value_name("SYNTAX"),
+        )
+        .arg(
+            Arg::new(options::SECTION_DELIMITER)
+                .short('d')
+                .long(options::SECTION_DELIMITER)
+                .help("use CC for separating logical pages")
+                .value_name("CC"),
+        )
+        .arg(
+            Arg::new(options::FOOTER_NUMBERING)
+                .short('f')
+                .long(options::FOOTER_NUMBERING)
+                .help("use STYLE for numbering footer lines")
+                .value_name("STYLE"),
+        )
+        .arg(
+            Arg::new(options::HEADER_NUMBERING)
+                .short('h')
+                .long(options::HEADER_NUMBERING)
+                .help("use STYLE for numbering header lines")
+                .value_name("STYLE"),
+        )
+        .arg(
+            Arg::new(options::LINE_INCREMENT)
+                .short('i')
+                .long(options::LINE_INCREMENT)
+                .help("line number increment at each line")
+                .value_name("NUMBER"),
+        )
+        .arg(
+            Arg::new(options::JOIN_BLANK_LINES)
+                .short('l')
+                .long(options::JOIN_BLANK_LINES)
+                .help("group of NUMBER empty lines counted as one")
+                .value_name("NUMBER"),
+        )
+        .arg(
+            Arg::new(options::NUMBER_FORMAT)
+                .short('n')
+                .long(options::NUMBER_FORMAT)
+                .help("insert line numbers according to FORMAT")
+                .value_name("FORMAT"),
+        )
+        .arg(
+            Arg::new(options::NO_RENUMBER)
+                .short('p')
+                .long(options::NO_RENUMBER)
+                .help("do not reset line numbers at logical pages"),
+        )
+        .arg(
+            Arg::new(options::NUMBER_SEPARATOR)
+                .short('s')
+                .long(options::NUMBER_SEPARATOR)
+                .help("add STRING after (possible) line number")
+                .value_name("STRING"),
+        )
+        .arg(
+            Arg::new(options::STARTING_LINE_NUMBER)
+                .short('v')
+                .long(options::STARTING_LINE_NUMBER)
+                .help("first line number on each logical page")
+                .value_name("NUMBER"),
+        )
+        .arg(
+            Arg::new(options::NUMBER_WIDTH)
+                .short('w')
+                .long(options::NUMBER_WIDTH)
+                .help("use NUMBER columns for line numbers")
+                .value_name("NUMBER"),
+        )
 }
 
 // nl implements the main functionality for an individual buffer.
-fn nl<T: Read>(reader: &mut BufReader<T>, settings: &Settings) {
+fn nl<T: Read>(reader: &mut BufReader<T>, settings: &Settings) -> UResult<()> {
     let regexp: regex::Regex = regex::Regex::new(r".?").unwrap();
     let mut line_no = settings.starting_line_number;
     // The current line number's width as a string. Using to_string is inefficient
@@ -229,9 +256,10 @@ fn nl<T: Read>(reader: &mut BufReader<T>, settings: &Settings) {
         _ => &regexp,
     };
     let mut line_filter: fn(&str, &regex::Regex) -> bool = pass_regex;
-    for mut l in reader.lines().map(|r| r.unwrap()) {
+    for l in reader.lines() {
+        let mut l = l.map_err_context(|| "could not read line".to_string())?;
         // Sanitize the string. We want to print the newline ourselves.
-        if !l.is_empty() && l.chars().rev().next().unwrap() == '\n' {
+        if l.ends_with('\n') {
             l.pop();
         }
         // Next we iterate through the individual chars to see if this
@@ -353,6 +381,7 @@ fn nl<T: Read>(reader: &mut BufReader<T>, settings: &Settings) {
             line_no_width += 1;
         }
     }
+    Ok(())
 }
 
 fn pass_regex(line: &str, re: &regex::Regex) -> bool {
@@ -369,12 +398,4 @@ fn pass_none(_: &str, _: &regex::Regex) -> bool {
 
 fn pass_all(_: &str, _: &regex::Regex) -> bool {
     true
-}
-
-fn print_usage(opts: &getopts::Options) {
-    println!("{}", opts.usage(USAGE));
-}
-
-fn version() {
-    println!("{} {}", NAME, VERSION);
 }

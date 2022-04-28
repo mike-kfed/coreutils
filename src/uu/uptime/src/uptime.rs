@@ -9,18 +9,19 @@
 // spell-checker:ignore (ToDO) getloadavg upsecs updays nusers loadavg boottime uphours upmins
 
 use chrono::{Local, TimeZone, Utc};
-use clap::{App, Arg};
+use clap::{crate_version, Arg, Command};
 
-#[macro_use]
-extern crate uucore;
+use uucore::format_usage;
 // import crate time from utmpx
 pub use uucore::libc;
 use uucore::libc::time_t;
 
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+use uucore::error::{UResult, USimpleError};
+
 static ABOUT: &str = "Display the current time, the length of time the system has been up,\n\
-the number of users on the system, and the average number of jobs\n\
-in the run queue over the last 1, 5 and 15 minutes.";
+                      the number of users on the system, and the average number of jobs\n\
+                      in the run queue over the last 1, 5 and 15 minutes.";
+const USAGE: &str = "{} [OPTION]...";
 pub mod options {
     pub static SINCE: &str = "since";
 }
@@ -33,35 +34,19 @@ extern "C" {
     fn GetTickCount() -> uucore::libc::uint32_t;
 }
 
-fn get_usage() -> String {
-    format!("{0} [OPTION]...", executable!())
-}
-
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
-    let matches = App::new(executable!())
-        .version(VERSION)
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::SINCE)
-                .short("s")
-                .long(options::SINCE)
-                .help("system up since"),
-        )
-        .get_matches_from(args);
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uu_app().get_matches_from(args);
 
     let (boot_time, user_count) = process_utmpx();
     let uptime = get_uptime(boot_time);
     if uptime < 0 {
-        show_error!("could not retrieve system uptime");
-
-        1
+        Err(USimpleError::new(1, "could not retrieve system uptime"))
     } else {
         if matches.is_present(options::SINCE) {
             let initial_date = Local.timestamp(Utc::now().timestamp() - uptime, 0);
             println!("{}", initial_date.format("%Y-%m-%d %H:%M:%S"));
-            return 0;
+            return Ok(());
         }
 
         print_time();
@@ -70,8 +55,22 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         print_nusers(user_count);
         print_loadavg();
 
-        0
+        Ok(())
     }
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::SINCE)
+                .short('s')
+                .long(options::SINCE)
+                .help("system up since"),
+        )
 }
 
 #[cfg(unix)]
@@ -177,7 +176,7 @@ fn print_uptime(upsecs: i64) {
     match updays.cmp(&1) {
         std::cmp::Ordering::Equal => print!("up {:1} day, {:2}:{:02},  ", updays, uphours, upmins),
         std::cmp::Ordering::Greater => {
-            print!("up {:1} days, {:2}:{:02},  ", updays, uphours, upmins)
+            print!("up {:1} days, {:2}:{:02},  ", updays, uphours, upmins);
         }
         _ => print!("up  {:2}:{:02}, ", uphours, upmins),
     };

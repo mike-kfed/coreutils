@@ -21,6 +21,7 @@ impl Basis for Montgomery<u64> {
 }
 
 impl Basis for Montgomery<u32> {
+    // spell-checker:ignore (names) Steve Worley
     // Small set of bases for the Miller-Rabin prime test, valid for all 32b integers;
     //  discovered by Steve Worley on 2013-05-27, see miller-rabin.appspot.com
     #[allow(clippy::unreadable_literal)]
@@ -41,7 +42,7 @@ pub(crate) enum Result {
 
 impl Result {
     pub(crate) fn is_prime(&self) -> bool {
-        *self == Result::Prime
+        *self == Self::Prime
     }
 }
 
@@ -68,7 +69,7 @@ pub(crate) fn test<A: Arithmetic + Basis>(m: A) -> Result {
             continue;
         }
 
-        let a = m.from_u64(_a);
+        let a = m.to_mod(_a);
 
         // x = a^r mod n
         let mut x = m.pow(a, r);
@@ -121,8 +122,8 @@ mod tests {
     }
 
     fn odd_primes() -> impl Iterator<Item = u64> {
-        use crate::table::{NEXT_PRIME, P_INVS_U64};
-        P_INVS_U64
+        use crate::table::{NEXT_PRIME, PRIME_INVERSIONS_U64};
+        PRIME_INVERSIONS_U64
             .iter()
             .map(|(p, _, _)| *p)
             .chain(iter::once(NEXT_PRIME))
@@ -199,7 +200,11 @@ mod tests {
 
     quickcheck! {
         fn composites(i: u64, j: u64) -> bool {
-            i < 2 || j < 2 || !is_prime(i*j)
+            // TODO: #1559 factor n > 2^64 - 1
+            match i.checked_mul(j) {
+                Some(n) => i < 2 || j < 2 || !is_prime(n),
+                _ => true,
+            }
         }
     }
 }

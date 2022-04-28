@@ -1,3 +1,5 @@
+# spell-checker:ignore (misc) testsuite runtest findstring (targets) busytest distclean manpages pkgs ; (vars/env) BINDIR BUILDDIR CARGOFLAGS DESTDIR DOCSDIR INSTALLDIR INSTALLEES MULTICALL DATAROOTDIR
+
 # Config options
 PROFILE         ?= debug
 MULTICALL       ?= n
@@ -20,17 +22,12 @@ CARGOFLAGS ?=
 # Install directories
 PREFIX ?= /usr/local
 DESTDIR ?=
-BINDIR ?= /bin
-MANDIR ?= /man/man1
+BINDIR ?= $(PREFIX)/bin
+DATAROOTDIR ?= $(PREFIX)/share
 
-INSTALLDIR_BIN=$(DESTDIR)$(PREFIX)$(BINDIR)
-INSTALLDIR_MAN=$(DESTDIR)$(PREFIX)/share/$(MANDIR)
-$(shell test -d $(INSTALLDIR_MAN))
-ifneq ($(.SHELLSTATUS),0)
-override INSTALLDIR_MAN=$(DESTDIR)$(PREFIX)$(MANDIR)
-endif
+INSTALLDIR_BIN=$(DESTDIR)$(BINDIR)
 
-#prefix to apply to uutils binary and all tool binaries
+#prefix to apply to coreutils binary and all tool binaries
 PROG_PREFIX ?=
 
 # This won't support any directory with spaces in its name, but you can just
@@ -41,13 +38,23 @@ PKG_BUILDDIR  := $(BUILDDIR)/deps
 DOCSDIR       := $(BASEDIR)/docs
 
 BUSYBOX_ROOT := $(BASEDIR)/tmp
-BUSYBOX_VER  := 1.24.1
+BUSYBOX_VER  := 1.32.1
 BUSYBOX_SRC  := $(BUSYBOX_ROOT)/busybox-$(BUSYBOX_VER)
+
+ifeq ($(SELINUX_ENABLED),)
+	SELINUX_ENABLED := 0
+	ifneq ($(OS),Windows_NT)
+		ifeq ($(shell /sbin/selinuxenabled 2>/dev/null ; echo $$?),0)
+			SELINUX_ENABLED := 1
+		endif
+	endif
+endif
 
 # Possible programs
 PROGS       := \
 	base32 \
 	base64 \
+	basenc \
 	basename \
 	cat \
 	cksum \
@@ -56,7 +63,9 @@ PROGS       := \
 	csplit \
 	cut \
 	date \
+	dd \
 	df \
+	dir \
 	dircolors \
 	dirname \
 	echo \
@@ -82,6 +91,7 @@ PROGS       := \
 	nproc \
 	od \
 	paste \
+	pr \
 	printenv \
 	printf \
 	ptx \
@@ -109,6 +119,7 @@ PROGS       := \
 	tsort \
 	unexpand \
 	uniq \
+	vdir \
 	wc \
 	whoami \
 	yes
@@ -144,8 +155,16 @@ UNIX_PROGS := \
 	users \
 	who
 
+SELINUX_PROGS := \
+	chcon \
+	runcon
+
 ifneq ($(OS),Windows_NT)
-	PROGS    := $(PROGS) $(UNIX_PROGS)
+	PROGS := $(PROGS) $(UNIX_PROGS)
+endif
+
+ifeq ($(SELINUX_ENABLED),1)
+	PROGS := $(PROGS) $(SELINUX_PROGS)
 endif
 
 UTILS ?= $(PROGS)
@@ -156,6 +175,7 @@ TEST_PROGS  := \
 	base64 \
 	basename \
 	cat \
+	chcon \
 	chgrp \
 	chmod \
 	chown \
@@ -188,6 +208,7 @@ TEST_PROGS  := \
 	paste \
 	pathchk \
 	pinky \
+	pr \
 	printf \
 	ptx \
 	pwd \
@@ -195,6 +216,7 @@ TEST_PROGS  := \
 	realpath \
 	rm \
 	rmdir \
+	runcon \
 	seq \
 	sort \
 	split \
@@ -224,11 +246,14 @@ TEST_SPEC_FEATURE :=
 ifneq ($(SPEC),)
 TEST_NO_FAIL_FAST :=--no-fail-fast
 TEST_SPEC_FEATURE := test_unimplemented
+else ifeq ($(SELINUX_ENABLED),1)
+TEST_NO_FAIL_FAST :=
+TEST_SPEC_FEATURE := feat_selinux
 endif
 
 define TEST_BUSYBOX
 test_busybox_$(1):
-	(cd $(BUSYBOX_SRC)/testsuite && bindir=$(BUILDDIR) ./runtest $(RUNTEST_ARGS) $(1) )
+	-(cd $(BUSYBOX_SRC)/testsuite && bindir=$(BUILDDIR) ./runtest $(RUNTEST_ARGS) $(1))
 endef
 
 # Output names
@@ -237,7 +262,7 @@ EXES        := \
 
 INSTALLEES  := ${EXES}
 ifeq (${MULTICALL}, y)
-INSTALLEES  := ${INSTALLEES} uutils
+INSTALLEES  := ${INSTALLEES} coreutils
 endif
 
 all: build
@@ -250,13 +275,10 @@ ifneq (${MULTICALL}, y)
 	${CARGO} build ${CARGOFLAGS} ${PROFILE_CMD} $(foreach pkg,$(EXES),-p uu_$(pkg))
 endif
 
-build-uutils:
+build-coreutils:
 	${CARGO} build ${CARGOFLAGS} --features "${EXES}" ${PROFILE_CMD} --no-default-features
 
-build-manpages:
-	cd $(DOCSDIR) && $(MAKE) man
-
-build: build-uutils build-pkgs build-manpages
+build: build-coreutils build-pkgs
 
 $(foreach test,$(filter-out $(SKIP_UTILS),$(PROGS)),$(eval $(call TEST_BUSYBOX,$(test))))
 
@@ -264,20 +286,24 @@ test:
 	${CARGO} test ${CARGOFLAGS} --features "$(TESTS) $(TEST_SPEC_FEATURE)" --no-default-features $(TEST_NO_FAIL_FAST)
 
 busybox-src:
-	if [ ! -e $(BUSYBOX_SRC) ]; then \
-	mkdir -p $(BUSYBOX_ROOT); \
-	wget https://busybox.net/downloads/busybox-$(BUSYBOX_VER).tar.bz2 -P $(BUSYBOX_ROOT); \
-	tar -C $(BUSYBOX_ROOT) -xf $(BUSYBOX_ROOT)/busybox-$(BUSYBOX_VER).tar.bz2; \
-	fi; \
+	if [ ! -e "$(BUSYBOX_SRC)" ] ; then \
+		mkdir -p "$(BUSYBOX_ROOT)" ; \
+		wget "https://busybox.net/downloads/busybox-$(BUSYBOX_VER).tar.bz2" -P "$(BUSYBOX_ROOT)" ; \
+		tar -C "$(BUSYBOX_ROOT)" -xf "$(BUSYBOX_ROOT)/busybox-$(BUSYBOX_VER).tar.bz2" ; \
+	fi ;
 
 # This is a busybox-specific config file their test suite wants to parse.
 $(BUILDDIR)/.config: $(BASEDIR)/.busybox-config
 	cp $< $@
 
-# Test under the busybox testsuite
-$(BUILDDIR)/busybox: busybox-src build-uutils $(BUILDDIR)/.config
-	cp $(BUILDDIR)/uutils $(BUILDDIR)/busybox; \
-	chmod +x $@;
+# Test under the busybox test suite
+$(BUILDDIR)/busybox: busybox-src build-coreutils $(BUILDDIR)/.config
+	cp "$(BUILDDIR)/coreutils" "$(BUILDDIR)/busybox"
+	chmod +x $@
+
+prepare-busytest: $(BUILDDIR)/busybox
+	# disable inapplicable tests
+	-( cd "$(BUSYBOX_SRC)/testsuite" ; if [ -e "busybox.tests" ] ; then mv busybox.tests busybox.tests- ; fi ; )
 
 ifeq ($(EXES),)
 busytest:
@@ -286,7 +312,7 @@ busytest: $(BUILDDIR)/busybox $(addprefix test_busybox_,$(filter-out $(SKIP_UTIL
 endif
 
 clean:
-	$(RM) $(BUILDDIR)
+	cargo clean
 	cd $(DOCSDIR) && $(MAKE) clean
 
 distclean: clean
@@ -294,25 +320,33 @@ distclean: clean
 
 install: build
 	mkdir -p $(INSTALLDIR_BIN)
-	mkdir -p $(INSTALLDIR_MAN)
 ifeq (${MULTICALL}, y)
-	$(INSTALL) $(BUILDDIR)/uutils $(INSTALLDIR_BIN)/$(PROG_PREFIX)uutils
-	cd $(INSTALLDIR_BIN) && $(foreach prog, $(filter-out uutils, $(INSTALLEES)), \
-		ln -fs $(PROG_PREFIX)uutils $(PROG_PREFIX)$(prog) &&) :
-	cat $(DOCSDIR)/_build/man/uutils.1 | gzip > $(INSTALLDIR_MAN)/$(PROG_PREFIX)uutils.1.gz
+	$(INSTALL) $(BUILDDIR)/coreutils $(INSTALLDIR_BIN)/$(PROG_PREFIX)coreutils
+	cd $(INSTALLDIR_BIN) && $(foreach prog, $(filter-out coreutils, $(INSTALLEES)), \
+		ln -fs $(PROG_PREFIX)coreutils $(PROG_PREFIX)$(prog) &&) :
+	$(if $(findstring test,$(INSTALLEES)), cd $(INSTALLDIR_BIN) && ln -fs $(PROG_PREFIX)coreutils $(PROG_PREFIX)[)
 else
 	$(foreach prog, $(INSTALLEES), \
 		$(INSTALL) $(BUILDDIR)/$(prog) $(INSTALLDIR_BIN)/$(PROG_PREFIX)$(prog);)
+	$(if $(findstring test,$(INSTALLEES)), $(INSTALL) $(BUILDDIR)/test $(INSTALLDIR_BIN)/$(PROG_PREFIX)[)
 endif
-	$(foreach man, $(filter $(INSTALLEES), $(basename $(notdir $(wildcard $(DOCSDIR)/_build/man/*)))), \
-		cat $(DOCSDIR)/_build/man/$(man).1 | gzip > $(INSTALLDIR_MAN)/$(PROG_PREFIX)$(man).1.gz &&) :
+	mkdir -p $(DESTDIR)$(DATAROOTDIR)/zsh/site-functions
+	mkdir -p $(DESTDIR)$(DATAROOTDIR)/bash-completion/completions
+	mkdir -p $(DESTDIR)$(DATAROOTDIR)/fish/vendor_completions.d
+	$(foreach prog, $(INSTALLEES), \
+		$(BUILDDIR)/coreutils completion $(prog) zsh > $(DESTDIR)$(DATAROOTDIR)/zsh/site-functions/_$(PROG_PREFIX)$(prog); \
+		$(BUILDDIR)/coreutils completion $(prog) bash > $(DESTDIR)$(DATAROOTDIR)/bash-completion/completions/$(PROG_PREFIX)$(prog); \
+		$(BUILDDIR)/coreutils completion $(prog) fish > $(DESTDIR)$(DATAROOTDIR)/fish/vendor_completions.d/$(PROG_PREFIX)$(prog).fish; \
+	)
 
 uninstall:
 ifeq (${MULTICALL}, y)
-	rm -f $(addprefix $(INSTALLDIR_BIN)/,$(PROG_PREFIX)uutils)
+	rm -f $(addprefix $(INSTALLDIR_BIN)/,$(PROG_PREFIX)coreutils)
 endif
-	rm -f $(addprefix $(INSTALLDIR_MAN)/,$(PROG_PREFIX)uutils.1.gz)
 	rm -f $(addprefix $(INSTALLDIR_BIN)/$(PROG_PREFIX),$(PROGS))
-	rm -f $(addprefix $(INSTALLDIR_MAN)/$(PROG_PREFIX),$(addsuffix .1.gz,$(PROGS)))
+	rm -f $(INSTALLDIR_BIN)/$(PROG_PREFIX)[
+	rm -f $(addprefix $(DESTDIR)$(DATAROOTDIR)/zsh/site-functions/_$(PROG_PREFIX),$(PROGS))
+	rm -f $(addprefix $(DESTDIR)$(DATAROOTDIR)/bash-completion/completions/$(PROG_PREFIX),$(PROGS))
+	rm -f $(addprefix $(DESTDIR)$(DATAROOTDIR)/fish/vendor_completions.d/$(PROG_PREFIX),$(addsuffix .fish,$(PROGS)))
 
-.PHONY: all build build-uutils build-pkgs build-docs test distclean clean busytest install uninstall
+.PHONY: all build build-coreutils build-pkgs test distclean clean busytest install uninstall

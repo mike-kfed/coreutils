@@ -11,18 +11,23 @@
 
 #[macro_use]
 extern crate uucore;
-
+use clap::{crate_version, Arg, Command};
 use std::fs::File;
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Read, Stdout, Write};
 use std::str::from_utf8;
 use unicode_width::UnicodeWidthChar;
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult};
+use uucore::{format_usage, InvalidEncodingHandling};
 
 static NAME: &str = "unexpand";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+static USAGE: &str = "{} [OPTION]... [FILE]...";
+static SUMMARY: &str = "Convert blanks in each FILE to tabs, writing to standard output.\n\
+                        With no FILE, or when FILE is -, read standard input.";
 
 const DEFAULT_TABSTOP: usize = 8;
 
-fn tabstops_parse(s: String) -> Vec<usize> {
+fn tabstops_parse(s: &str) -> Vec<usize> {
     let words = s.split(',');
 
     let nums = words
@@ -46,6 +51,14 @@ fn tabstops_parse(s: String) -> Vec<usize> {
     nums
 }
 
+mod options {
+    pub const FILE: &str = "file";
+    pub const ALL: &str = "all";
+    pub const FIRST_ONLY: &str = "first-only";
+    pub const TABS: &str = "tabs";
+    pub const NO_UTF8: &str = "no-utf8";
+}
+
 struct Options {
     files: Vec<String>,
     tabstops: Vec<usize>,
@@ -54,23 +67,22 @@ struct Options {
 }
 
 impl Options {
-    fn new(matches: getopts::Matches) -> Options {
-        let tabstops = match matches.opt_str("t") {
+    fn new(matches: &clap::ArgMatches) -> Self {
+        let tabstops = match matches.value_of(options::TABS) {
             None => vec![DEFAULT_TABSTOP],
             Some(s) => tabstops_parse(s),
         };
 
-        let aflag = (matches.opt_present("all") || matches.opt_present("tabs"))
-            && !matches.opt_present("first-only");
-        let uflag = !matches.opt_present("U");
+        let aflag = (matches.is_present(options::ALL) || matches.is_present(options::TABS))
+            && !matches.is_present(options::FIRST_ONLY);
+        let uflag = !matches.is_present(options::NO_UTF8);
 
-        let files = if matches.free.is_empty() {
-            vec!["-".to_owned()]
-        } else {
-            matches.free
+        let files = match matches.value_of(options::FILE) {
+            Some(v) => vec![v.to_string()],
+            None => vec!["-".to_owned()],
         };
 
-        Options {
+        Self {
             files,
             tabstops,
             aflag,
@@ -79,77 +91,61 @@ impl Options {
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::Ignore)
+        .accept_any();
 
-    let mut opts = getopts::Options::new();
+    let matches = uu_app().get_matches_from(args);
 
-    opts.optflag(
-        "a",
-        "all",
-        "convert all blanks, instead of just initial blanks",
-    );
-    opts.optflag(
-        "",
-        "first-only",
-        "convert only leading sequences of blanks (overrides -a)",
-    );
-    opts.optopt(
-        "t",
-        "tabs",
-        "have tabs N characters apart instead of 8 (enables -a)",
-        "N",
-    );
-    opts.optopt(
-        "t",
-        "tabs",
-        "use comma separated LIST of tab positions (enables -a)",
-        "LIST",
-    );
-    opts.optflag(
-        "U",
-        "no-utf8",
-        "interpret input file as 8-bit ASCII rather than UTF-8",
-    );
-    opts.optflag("h", "help", "display this help and exit");
-    opts.optflag("V", "version", "output version information and exit");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => crash!(1, "{}", f),
-    };
-
-    if matches.opt_present("help") {
-        println!("{} {}\n", NAME, VERSION);
-        println!("Usage: {} [OPTION]... [FILE]...\n", NAME);
-        println!(
-            "{}",
-            opts.usage(
-                "Convert blanks in each FILE to tabs, writing to standard output.\n\
-                 With no FILE, or when FILE is -, read standard input."
-            )
-        );
-        return 0;
-    }
-
-    if matches.opt_present("V") {
-        println!("{} {}", NAME, VERSION);
-        return 0;
-    }
-
-    unexpand(Options::new(matches));
-
-    0
+    unexpand(&Options::new(&matches)).map_err_context(String::new)
 }
 
-fn open(path: String) -> BufReader<Box<dyn Read + 'static>> {
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .name(NAME)
+        .version(crate_version!())
+        .override_usage(format_usage(USAGE))
+        .about(SUMMARY)
+        .infer_long_args(true)
+        .arg(Arg::new(options::FILE).hide(true).multiple_occurrences(true))
+        .arg(
+            Arg::new(options::ALL)
+                .short('a')
+                .long(options::ALL)
+                .help("convert all blanks, instead of just initial blanks")
+                .takes_value(false),
+        )
+        .arg(
+            Arg::new(options::FIRST_ONLY)
+                .long(options::FIRST_ONLY)
+                .help("convert only leading sequences of blanks (overrides -a)")
+                .takes_value(false),
+        )
+        .arg(
+            Arg::new(options::TABS)
+                .short('t')
+                .long(options::TABS)
+                .help("use comma separated LIST of tab positions or have tabs N characters apart instead of 8 (enables -a)")
+                .takes_value(true)
+        )
+        .arg(
+            Arg::new(options::NO_UTF8)
+                .short('U')
+                .long(options::NO_UTF8)
+                .takes_value(false)
+                .help("interpret input file as 8-bit ASCII rather than UTF-8"))
+}
+
+fn open(path: &str) -> BufReader<Box<dyn Read + 'static>> {
     let file_buf;
     if path == "-" {
         BufReader::new(Box::new(stdin()) as Box<dyn Read>)
     } else {
-        file_buf = match File::open(&path[..]) {
+        file_buf = match File::open(&path) {
             Ok(a) => a,
-            Err(e) => crash!(1, "{}: {}", &path[..], e),
+            Err(e) => crash!(1, "{}: {}", path.maybe_quote(), e),
         };
         BufReader::new(Box::new(file_buf) as Box<dyn Read>)
     }
@@ -160,10 +156,8 @@ fn next_tabstop(tabstops: &[usize], col: usize) -> Option<usize> {
         Some(tabstops[0] - col % tabstops[0])
     } else {
         // find next larger tab
-        match tabstops.iter().find(|&&t| t > col) {
-            Some(t) => Some(t - col),
-            None => None, // if there isn't one in the list, tab becomes a single space
-        }
+        // if there isn't one in the list, tab becomes a single space
+        tabstops.iter().find(|&&t| t > col).map(|t| t - col)
     }
 }
 
@@ -186,13 +180,13 @@ fn write_tabs(
                 break;
             }
 
-            safe_unwrap!(output.write_all(b"\t"));
+            crash_if_err!(1, output.write_all(b"\t"));
             scol += nts;
         }
     }
 
     while col > scol {
-        safe_unwrap!(output.write_all(b" "));
+        crash_if_err!(1, output.write_all(b" "));
         scol += 1;
     }
 }
@@ -249,13 +243,13 @@ fn next_char_info(uflag: bool, buf: &[u8], byte: usize) -> (CharType, usize, usi
     (ctype, cwidth, nbytes)
 }
 
-fn unexpand(options: Options) {
+fn unexpand(options: &Options) -> std::io::Result<()> {
     let mut output = BufWriter::new(stdout());
     let ts = &options.tabstops[..];
     let mut buf = Vec::new();
     let lastcol = if ts.len() > 1 { *ts.last().unwrap() } else { 0 };
 
-    for file in options.files.into_iter() {
+    for file in &options.files {
         let mut fh = open(file);
 
         while match fh.read_until(b'\n', &mut buf) {
@@ -280,7 +274,7 @@ fn unexpand(options: Options) {
                         init,
                         true,
                     );
-                    safe_unwrap!(output.write_all(&buf[byte..]));
+                    output.write_all(&buf[byte..])?;
                     scol = col;
                     break;
                 }
@@ -300,7 +294,7 @@ fn unexpand(options: Options) {
                         };
 
                         if !tabs_buffered {
-                            safe_unwrap!(output.write_all(&buf[byte..byte + nbytes]));
+                            output.write_all(&buf[byte..byte + nbytes])?;
                             scol = col; // now printed up to this column
                         }
                     }
@@ -325,7 +319,7 @@ fn unexpand(options: Options) {
                         } else {
                             0
                         };
-                        safe_unwrap!(output.write_all(&buf[byte..byte + nbytes]));
+                        output.write_all(&buf[byte..byte + nbytes])?;
                         scol = col; // we've now printed up to this column
                     }
                 }
@@ -344,9 +338,9 @@ fn unexpand(options: Options) {
                 init,
                 true,
             );
-            safe_unwrap!(output.flush());
+            output.flush()?;
             buf.truncate(0); // clear out the buffer
         }
     }
-    crash_if_err!(1, output.flush())
+    output.flush()
 }

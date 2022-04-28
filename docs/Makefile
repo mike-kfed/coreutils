@@ -1,5 +1,4 @@
-USEGNU=gmake $*
-all:
-	@$(USEGNU)
-.DEFAULT:
-	@$(USEGNU)
+clean:
+	rm -rf book
+	rm -f src/SUMMARY.md
+	rm -f src/utils/*

@@ -6,27 +6,32 @@
 // For the full copyright and license information, please view the LICENSE file
 // that was distributed with this source code.
 
-// spell-checker:ignore (ToDO) filetime strptime utcoff strs datetime MMDDhhmm
+// spell-checker:ignore (ToDO) filetime strptime utcoff strs datetime MMDDhhmm clapv PWSTR lpszfilepath hresult
 
 pub extern crate filetime;
 
 #[macro_use]
 extern crate uucore;
 
-use clap::{App, Arg};
+use clap::{crate_version, Arg, ArgGroup, Command};
 use filetime::*;
 use std::fs::{self, File};
-use std::io::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UError, UResult, USimpleError};
+use uucore::format_usage;
 
-static VERSION: &str = env!("CARGO_PKG_VERSION");
 static ABOUT: &str = "Update the access and modification times of each FILE to the current time.";
+const USAGE: &str = "{} [OPTION]... [USER]";
 pub mod options {
+    // Both SOURCES and sources are needed as we need to be able to refer to the ArgGroup.
+    pub static SOURCES: &str = "sources";
     pub mod sources {
         pub static DATE: &str = "date";
         pub static REFERENCE: &str = "reference";
         pub static CURRENT: &str = "current";
     }
+    pub static HELP: &str = "help";
     pub static ACCESS: &str = "access";
     pub static MODIFICATION: &str = "modification";
     pub static NO_CREATE: &str = "no-create";
@@ -36,162 +41,75 @@ pub mod options {
 
 static ARG_FILES: &str = "files";
 
-// Since touch's date/timestamp parsing doesn't account for timezone, the
-// returned value from time::strptime() is UTC. We get system's timezone to
-// localize the time.
-macro_rules! to_local(
-    ($exp:expr) => ({
-        let mut tm = $exp;
-        tm.tm_utcoff = time::now().tm_utcoff;
-        tm
-    })
-);
-
-macro_rules! local_tm_to_filetime(
-    ($exp:expr) => ({
-        let ts = $exp.to_timespec();
-        FileTime::from_unix_time(ts.sec as i64, ts.nsec as u32)
-    })
-);
-
-fn get_usage() -> String {
-    format!("{0} [OPTION]... [USER]", executable!())
+fn to_local(mut tm: time::Tm) -> time::Tm {
+    tm.tm_utcoff = time::now().tm_utcoff;
+    tm
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+fn local_tm_to_filetime(tm: time::Tm) -> FileTime {
+    let ts = tm.to_timespec();
+    FileTime::from_unix_time(ts.sec as i64, ts.nsec as u32)
+}
 
-    let matches = App::new(executable!())
-        .version(VERSION)
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(
-            Arg::with_name(options::ACCESS)
-                .short("a")
-                .help("change only the access time"),
-        )
-        .arg(
-            Arg::with_name(options::sources::CURRENT)
-                .short("t")
-                .help("use [[CC]YY]MMDDhhmm[.ss] instead of the current time")
-                .value_name("STAMP")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name(options::sources::DATE)
-                .short("d")
-                .long(options::sources::DATE)
-                .help("parse argument and use it instead of current time")
-                .value_name("STRING"),
-        )
-        .arg(
-            Arg::with_name(options::MODIFICATION)
-                .short("m")
-                .help("change only the modification time"),
-        )
-        .arg(
-            Arg::with_name(options::NO_CREATE)
-                .short("c")
-                .long(options::NO_CREATE)
-                .help("do not create any files"),
-        )
-        .arg(
-            Arg::with_name(options::NO_DEREF)
-                .short("h")
-                .long(options::NO_DEREF)
-                .help(
-                    "affect each symbolic link instead of any referenced file \
-                     (only for systems that can change the timestamps of a symlink)",
-                ),
-        )
-        .arg(
-            Arg::with_name(options::sources::REFERENCE)
-                .short("r")
-                .long(options::sources::REFERENCE)
-                .help("use this file's times instead of the current time")
-                .value_name("FILE"),
-        )
-        .arg(
-            Arg::with_name(options::TIME)
-                .long(options::TIME)
-                .help(
-                    "change only the specified time: \"access\", \"atime\", or \
-                     \"use\" are equivalent to -a; \"modify\" or \"mtime\" are \
-                     equivalent to -m",
-                )
-                .value_name("WORD")
-                .possible_values(&["access", "atime", "use"])
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name(ARG_FILES)
-                .multiple(true)
-                .takes_value(true)
-                .min_values(1),
-        )
-        .get_matches_from(args);
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let matches = uu_app().get_matches_from(args);
 
-    let files: Vec<String> = matches
-        .values_of(ARG_FILES)
-        .map(|v| v.map(ToString::to_string).collect())
-        .unwrap_or_default();
-
-    if matches.is_present(options::sources::DATE)
-        && (matches.is_present(options::sources::REFERENCE)
-            || matches.is_present(options::sources::CURRENT))
-        || matches.is_present(options::sources::REFERENCE)
-            && (matches.is_present(options::sources::DATE)
-                || matches.is_present(options::sources::CURRENT))
-        || matches.is_present(options::sources::CURRENT)
-            && (matches.is_present(options::sources::DATE)
-                || matches.is_present(options::sources::REFERENCE))
-    {
-        panic!("Invalid options: cannot specify reference time from more than one source");
-    }
-
-    let (mut atime, mut mtime) = if matches.is_present(options::sources::REFERENCE) {
-        stat(
-            &matches.value_of(options::sources::REFERENCE).unwrap()[..],
-            !matches.is_present(options::NO_DEREF),
+    let files = matches.values_of_os(ARG_FILES).ok_or_else(|| {
+        USimpleError::new(
+            1,
+            r##"missing file operand
+Try 'touch --help' for more information."##,
         )
-    } else if matches.is_present(options::sources::DATE)
-        || matches.is_present(options::sources::CURRENT)
-    {
-        let timestamp = if matches.is_present(options::sources::DATE) {
-            parse_date(matches.value_of(options::sources::DATE).unwrap().as_ref())
+    })?;
+
+    let (mut atime, mut mtime) =
+        if let Some(reference) = matches.value_of_os(options::sources::REFERENCE) {
+            stat(Path::new(reference), !matches.is_present(options::NO_DEREF))?
         } else {
-            parse_timestamp(
-                matches
-                    .value_of(options::sources::CURRENT)
-                    .unwrap()
-                    .as_ref(),
-            )
+            let timestamp = if let Some(date) = matches.value_of(options::sources::DATE) {
+                parse_date(date)?
+            } else if let Some(current) = matches.value_of(options::sources::CURRENT) {
+                parse_timestamp(current)?
+            } else {
+                local_tm_to_filetime(time::now())
+            };
+            (timestamp, timestamp)
         };
-        (timestamp, timestamp)
-    } else {
-        let now = local_tm_to_filetime!(time::now());
-        (now, now)
-    };
 
-    for filename in &files {
-        let path = &filename[..];
+    for filename in files {
+        // FIXME: find a way to avoid having to clone the path
+        let pathbuf = if filename == "-" {
+            pathbuf_from_stdout()?
+        } else {
+            PathBuf::from(filename)
+        };
 
-        if !Path::new(path).exists() {
-            // no-dereference included here for compatibility
-            if matches.is_present(options::NO_CREATE) || matches.is_present(options::NO_DEREF) {
+        let path = pathbuf.as_path();
+
+        if !path.exists() {
+            if matches.is_present(options::NO_CREATE) {
+                continue;
+            }
+
+            if matches.is_present(options::NO_DEREF) {
+                show!(USimpleError::new(
+                    1,
+                    format!(
+                        "setting times of {}: No such file or directory",
+                        filename.quote()
+                    )
+                ));
                 continue;
             }
 
             if let Err(e) = File::create(path) {
-                show_warning!("cannot touch '{}': {}", path, e);
+                show!(e.map_err_context(|| format!("cannot touch {}", path.quote())));
                 continue;
             };
 
             // Minor optimization: if no reference time was specified, we're done.
-            if !(matches.is_present(options::sources::DATE)
-                || matches.is_present(options::sources::REFERENCE)
-                || matches.is_present(options::sources::CURRENT))
-            {
+            if !matches.is_present(options::SOURCES) {
                 continue;
             }
         }
@@ -202,7 +120,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             || matches.is_present(options::MODIFICATION)
             || matches.is_present(options::TIME)
         {
-            let st = stat(path, !matches.is_present(options::NO_DEREF));
+            let st = stat(path, !matches.is_present(options::NO_DEREF))?;
             let time = matches.value_of(options::TIME).unwrap_or("");
 
             if !(matches.is_present(options::ACCESS)
@@ -222,50 +140,138 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         }
 
         if matches.is_present(options::NO_DEREF) {
-            if let Err(e) = set_symlink_file_times(path, atime, mtime) {
-                show_warning!("cannot touch '{}': {}", path, e);
-            }
-        } else if let Err(e) = filetime::set_file_times(path, atime, mtime) {
-            show_warning!("cannot touch '{}': {}", path, e);
+            set_symlink_file_times(path, atime, mtime)
+        } else {
+            filetime::set_file_times(path, atime, mtime)
         }
+        .map_err_context(|| format!("setting times of {}", path.quote()))?;
     }
 
-    0
+    Ok(())
 }
 
-fn stat(path: &str, follow: bool) -> (FileTime, FileTime) {
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::HELP)
+                .long(options::HELP)
+                .help("Print help information."),
+        )
+        .arg(
+            Arg::new(options::ACCESS)
+                .short('a')
+                .help("change only the access time"),
+        )
+        .arg(
+            Arg::new(options::sources::CURRENT)
+                .short('t')
+                .help("use [[CC]YY]MMDDhhmm[.ss] instead of the current time")
+                .value_name("STAMP")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new(options::sources::DATE)
+                .short('d')
+                .long(options::sources::DATE)
+                .help("parse argument and use it instead of current time")
+                .value_name("STRING"),
+        )
+        .arg(
+            Arg::new(options::MODIFICATION)
+                .short('m')
+                .help("change only the modification time"),
+        )
+        .arg(
+            Arg::new(options::NO_CREATE)
+                .short('c')
+                .long(options::NO_CREATE)
+                .help("do not create any files"),
+        )
+        .arg(
+            Arg::new(options::NO_DEREF)
+                .short('h')
+                .long(options::NO_DEREF)
+                .help(
+                    "affect each symbolic link instead of any referenced file \
+                     (only for systems that can change the timestamps of a symlink)",
+                ),
+        )
+        .arg(
+            Arg::new(options::sources::REFERENCE)
+                .short('r')
+                .long(options::sources::REFERENCE)
+                .help("use this file's times instead of the current time")
+                .value_name("FILE")
+                .allow_invalid_utf8(true),
+        )
+        .arg(
+            Arg::new(options::TIME)
+                .long(options::TIME)
+                .help(
+                    "change only the specified time: \"access\", \"atime\", or \
+                     \"use\" are equivalent to -a; \"modify\" or \"mtime\" are \
+                     equivalent to -m",
+                )
+                .value_name("WORD")
+                .possible_values(&["access", "atime", "use"])
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new(ARG_FILES)
+                .multiple_occurrences(true)
+                .takes_value(true)
+                .min_values(1)
+                .allow_invalid_utf8(true),
+        )
+        .group(ArgGroup::new(options::SOURCES).args(&[
+            options::sources::CURRENT,
+            options::sources::DATE,
+            options::sources::REFERENCE,
+        ]))
+}
+
+fn stat(path: &Path, follow: bool) -> UResult<(FileTime, FileTime)> {
     let metadata = if follow {
         fs::symlink_metadata(path)
     } else {
         fs::metadata(path)
-    };
-
-    match metadata {
-        Ok(m) => (
-            FileTime::from_last_access_time(&m),
-            FileTime::from_last_modification_time(&m),
-        ),
-        Err(_) => crash!(
-            1,
-            "failed to get attributes of '{}': {}",
-            path,
-            Error::last_os_error()
-        ),
     }
+    .map_err_context(|| format!("failed to get attributes of {}", path.quote()))?;
+
+    Ok((
+        FileTime::from_last_access_time(&metadata),
+        FileTime::from_last_modification_time(&metadata),
+    ))
 }
 
-fn parse_date(str: &str) -> FileTime {
+fn parse_date(str: &str) -> UResult<FileTime> {
     // This isn't actually compatible with GNU touch, but there doesn't seem to
     // be any simple specification for what format this parameter allows and I'm
     // not about to implement GNU parse_datetime.
     // http://git.savannah.gnu.org/gitweb/?p=gnulib.git;a=blob_plain;f=lib/parse-datetime.y
-    match time::strptime(str, "%c") {
-        Ok(tm) => local_tm_to_filetime!(to_local!(tm)),
-        Err(e) => panic!("Unable to parse date\n{}", e),
+    let formats = vec!["%c", "%F"];
+    for f in formats {
+        if let Ok(tm) = time::strptime(str, f) {
+            return Ok(local_tm_to_filetime(to_local(tm)));
+        }
     }
+
+    if let Ok(tm) = time::strptime(str, "@%s") {
+        // Don't convert to local time in this case - seconds since epoch are not time-zone dependent
+        return Ok(local_tm_to_filetime(tm));
+    }
+
+    Err(USimpleError::new(
+        1,
+        format!("Unable to parse date: {}", str),
+    ))
 }
 
-fn parse_timestamp(s: &str) -> FileTime {
+fn parse_timestamp(s: &str) -> UResult<FileTime> {
     let now = time::now();
     let (format, ts) = match s.chars().count() {
         15 => ("%Y%m%d%H%M.%S", s.to_owned()),
@@ -274,11 +280,126 @@ fn parse_timestamp(s: &str) -> FileTime {
         10 => ("%y%m%d%H%M", s.to_owned()),
         11 => ("%Y%m%d%H%M.%S", format!("{}{}", now.tm_year + 1900, s)),
         8 => ("%Y%m%d%H%M", format!("{}{}", now.tm_year + 1900, s)),
-        _ => panic!("Unknown timestamp format"),
+        _ => {
+            return Err(USimpleError::new(
+                1,
+                format!("invalid date format {}", s.quote()),
+            ))
+        }
     };
 
-    match time::strptime(&ts, format) {
-        Ok(tm) => local_tm_to_filetime!(to_local!(tm)),
-        Err(e) => panic!("Unable to parse timestamp\n{}", e),
+    let tm = time::strptime(&ts, format)
+        .map_err(|_| USimpleError::new(1, format!("invalid date format {}", s.quote())))?;
+
+    let mut local = to_local(tm);
+    local.tm_isdst = -1;
+    let ft = local_tm_to_filetime(local);
+
+    // We have to check that ft is valid time. Due to daylight saving
+    // time switch, local time can jump from 1:59 AM to 3:00 AM,
+    // in which case any time between 2:00 AM and 2:59 AM is not valid.
+    // Convert back to local time and see if we got the same value back.
+    let ts = time::Timespec {
+        sec: ft.unix_seconds(),
+        nsec: 0,
+    };
+    let tm2 = time::at(ts);
+    if tm.tm_hour != tm2.tm_hour {
+        return Err(USimpleError::new(
+            1,
+            format!("invalid date format {}", s.quote()),
+        ));
+    }
+
+    Ok(ft)
+}
+
+// TODO: this may be a good candidate to put in fsext.rs
+/// Returns a PathBuf to stdout.
+///
+/// On Windows, uses GetFinalPathNameByHandleW to attempt to get the path
+/// from the stdout handle.
+fn pathbuf_from_stdout() -> UResult<PathBuf> {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        Ok(PathBuf::from("/dev/stdout"))
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(PathBuf::from("/proc/self/fd/1"))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::prelude::AsRawHandle;
+        use winapi::shared::minwindef::{DWORD, MAX_PATH};
+        use winapi::shared::winerror::{
+            ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_PATH_NOT_FOUND,
+        };
+        use winapi::um::errhandlingapi::GetLastError;
+        use winapi::um::fileapi::GetFinalPathNameByHandleW;
+        use winapi::um::winnt::WCHAR;
+
+        let handle = std::io::stdout().lock().as_raw_handle();
+        let mut file_path_buffer: [WCHAR; MAX_PATH as usize] = [0; MAX_PATH as usize];
+
+        // Couldn't find this in winapi
+        const FILE_NAME_OPENED: DWORD = 0x8;
+
+        // https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlea#examples
+        // SAFETY: We transmute the handle to be able to cast *mut c_void into a
+        // HANDLE (i32) so rustc will let us call GetFinalPathNameByHandleW. The
+        // reference example code for GetFinalPathNameByHandleW implies that
+        // it is safe for us to leave lpszfilepath uninitialized, so long as
+        // the buffer size is correct. We know the buffer size (MAX_PATH) at
+        // compile time. MAX_PATH is a small number (260) so we can cast it
+        // to a u32.
+        let ret = unsafe {
+            GetFinalPathNameByHandleW(
+                std::mem::transmute(handle),
+                file_path_buffer.as_mut_ptr(),
+                file_path_buffer.len() as u32,
+                FILE_NAME_OPENED,
+            )
+        };
+
+        let buffer_size = match ret {
+            ERROR_PATH_NOT_FOUND | ERROR_NOT_ENOUGH_MEMORY | ERROR_INVALID_PARAMETER => {
+                return Err(USimpleError::new(
+                    1,
+                    format!("GetFinalPathNameByHandleW failed with code {}", ret),
+                ))
+            }
+            e if e == 0 => {
+                return Err(USimpleError::new(
+                    1,
+                    format!(
+                        "GetFinalPathNameByHandleW failed with code {}",
+                        // SAFETY: GetLastError is thread-safe and has no documented memory unsafety.
+                        unsafe { GetLastError() }
+                    ),
+                ));
+            }
+            e => e as usize,
+        };
+
+        // Don't include the null terminator
+        Ok(String::from_utf16(&file_path_buffer[0..buffer_size])
+            .map_err(|e| USimpleError::new(1, e.to_string()))?
+            .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn test_get_pathbuf_from_stdout_fails_if_stdout_is_not_a_file() {
+        // We can trigger an error by not setting stdout to anything (will
+        // fail with code 1)
+        assert!(super::pathbuf_from_stdout()
+            .err()
+            .expect("pathbuf_from_stdout should have failed")
+            .to_string()
+            .contains("GetFinalPathNameByHandleW failed with code 1"));
     }
 }

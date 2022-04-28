@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Copy)]
 pub enum FormatWriter {
     IntWriter(fn(u64) -> String),
@@ -17,7 +18,7 @@ impl Clone for FormatWriter {
 }
 
 impl PartialEq for FormatWriter {
-    fn eq(&self, other: &FormatWriter) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         use crate::formatteriteminfo::FormatWriter::*;
 
         match (self, other) {

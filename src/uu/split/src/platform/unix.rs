@@ -2,6 +2,8 @@ use std::env;
 use std::io::Write;
 use std::io::{BufWriter, Result};
 use std::process::{Child, Command, Stdio};
+use uucore::crash;
+
 /// A writer that writes to a shell_process' stdin
 ///
 /// We use a shell process (not directly calling a sub-process) so we can forward the name of the
@@ -37,10 +39,10 @@ struct WithEnvVarSet {
 }
 impl WithEnvVarSet {
     /// Save previous value assigned to key, set key=value
-    fn new(key: &str, value: &str) -> WithEnvVarSet {
+    fn new(key: &str, value: &str) -> Self {
         let previous_env_value = env::var(key);
         env::set_var(key, value);
-        WithEnvVarSet {
+        Self {
             _previous_var_key: String::from(key),
             _previous_var_value: previous_env_value,
         }
@@ -53,7 +55,7 @@ impl Drop for WithEnvVarSet {
         if let Ok(ref prev_value) = self._previous_var_value {
             env::set_var(&self._previous_var_key, &prev_value);
         } else {
-            env::remove_var(&self._previous_var_key)
+            env::remove_var(&self._previous_var_key);
         }
     }
 }
@@ -64,9 +66,9 @@ impl FilterWriter {
     ///
     /// * `command` - The shell command to execute
     /// * `filepath` - Path of the output file (forwarded to command as $FILE)
-    fn new(command: &str, filepath: &str) -> FilterWriter {
+    fn new(command: &str, filepath: &str) -> Self {
         // set $FILE, save previous value (if there was one)
-        let _with_env_var_set = WithEnvVarSet::new("FILE", &filepath);
+        let _with_env_var_set = WithEnvVarSet::new("FILE", filepath);
 
         let shell_process =
             Command::new(env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
@@ -76,7 +78,7 @@ impl FilterWriter {
                 .spawn()
                 .expect("Couldn't spawn filter command");
 
-        FilterWriter { shell_process }
+        Self { shell_process }
     }
 }
 
@@ -117,7 +119,7 @@ pub fn instantiate_current_writer(
         ) as Box<dyn Write>),
         Some(ref filter_command) => BufWriter::new(Box::new(
             // spawn a shell command and write to it
-            FilterWriter::new(&filter_command, &filename),
+            FilterWriter::new(filter_command, filename),
         ) as Box<dyn Write>),
     }
 }

@@ -9,71 +9,73 @@
 
 // spell-checker:ignore (ToDO) ttyname filedesc
 
-#[macro_use]
-extern crate uucore;
-
+use clap::{crate_version, Arg, Command};
 use std::ffi::CStr;
-use uucore::fs::is_stdin_interactive;
+use std::io::Write;
+use uucore::error::UResult;
+use uucore::{format_usage, InvalidEncodingHandling};
 
-extern "C" {
-    fn ttyname(filedesc: libc::c_int) -> *const libc::c_char;
+static ABOUT: &str = "Print the file name of the terminal connected to standard input.";
+const USAGE: &str = "{} [OPTION]...";
+
+mod options {
+    pub const SILENT: &str = "silent";
 }
 
-static NAME: &str = "tty";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+    let matches = uu_app().get_matches_from(args);
 
-    let mut opts = getopts::Options::new();
+    let silent = matches.is_present(options::SILENT);
 
-    opts.optflag("s", "silent", "print nothing, only return an exit status");
-    opts.optflag("h", "help", "display this help and exit");
-    opts.optflag("V", "version", "output version information and exit");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => crash!(2, "{}", f),
+    // Call libc function ttyname
+    let tty = unsafe {
+        let ptr = libc::ttyname(libc::STDIN_FILENO);
+        if !ptr.is_null() {
+            String::from_utf8_lossy(CStr::from_ptr(ptr).to_bytes()).to_string()
+        } else {
+            "".to_owned()
+        }
     };
 
-    if matches.opt_present("help") {
-        println!("{} {}", NAME, VERSION);
-        println!();
-        println!("Usage:");
-        println!("  {} [OPTION]...", NAME);
-        println!();
-        print!(
-            "{}",
-            opts.usage("Print the file name of the terminal connected to standard input.")
-        );
-    } else if matches.opt_present("version") {
-        println!("{} {}", NAME, VERSION);
-    } else {
-        let silent = matches.opt_present("s");
+    let mut stdout = std::io::stdout();
 
-        let tty = unsafe {
-            let ptr = ttyname(libc::STDIN_FILENO);
-            if !ptr.is_null() {
-                String::from_utf8_lossy(CStr::from_ptr(ptr).to_bytes()).to_string()
-            } else {
-                "".to_owned()
-            }
-        };
-
-        if !silent {
-            if !tty.chars().all(|c| c.is_whitespace()) {
-                println!("{}", tty);
-            } else {
-                println!("not a tty");
-            }
-        }
-
-        return if is_stdin_interactive() {
-            libc::EXIT_SUCCESS
+    if !silent {
+        let write_result = if !tty.chars().all(|c| c.is_whitespace()) {
+            writeln!(stdout, "{}", tty)
         } else {
-            libc::EXIT_FAILURE
+            writeln!(stdout, "not a tty")
         };
+        if write_result.is_err() || stdout.flush().is_err() {
+            // Don't return to prevent a panic later when another flush is attempted
+            // because the `uucore_procs::main` macro inserts a flush after execution for every utility.
+            std::process::exit(3);
+        }
     }
 
-    0
+    if atty::is(atty::Stream::Stdin) {
+        Ok(())
+    } else {
+        Err(libc::EXIT_FAILURE.into())
+    }
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::SILENT)
+                .long(options::SILENT)
+                .visible_alias("quiet")
+                .short('s')
+                .help("print nothing, only return an exit status")
+                .required(false),
+        )
 }

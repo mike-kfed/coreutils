@@ -5,21 +5,20 @@
 // For the full copyright and license information, please view the LICENSE file
 // that was distributed with this source code.
 
-// spell-checker:ignore (ToDO) mtab fsext showfs otype fmtstr prec ftype blocksize nlink rdev fnodes fsid namelen blksize inodes fstype iosize statfs gnulib NBLOCKSIZE
-
-#[macro_use]
-mod fsext;
-pub use crate::fsext::*;
-
 #[macro_use]
 extern crate uucore;
-use uucore::entries;
+use uucore::display::Quotable;
+use uucore::error::{UResult, USimpleError};
+use uucore::fs::display_permissions;
+use uucore::fsext::{
+    pretty_filetype, pretty_fstype, pretty_time, read_fs_list, statfs, BirthTime, FsMeta,
+};
+use uucore::libc::mode_t;
+use uucore::{entries, format_usage};
 
-use clap::{App, Arg, ArgMatches};
+use clap::{crate_version, Arg, ArgMatches, Command};
 use std::borrow::Cow;
 use std::convert::AsRef;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::{cmp, fs, iter};
@@ -27,7 +26,10 @@ use std::{cmp, fs, iter};
 macro_rules! check_bound {
     ($str: ident, $bound:expr, $beg: expr, $end: expr) => {
         if $end >= $bound {
-            return Err(format!("‘{}’: invalid directive", &$str[$beg..$end]));
+            return Err(USimpleError::new(
+                1,
+                format!("{}: invalid directive", $str[$beg..$end].quote()),
+            ));
         }
     };
 }
@@ -85,7 +87,7 @@ macro_rules! print_adjusted {
 }
 
 static ABOUT: &str = "Display file or file system status.";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+const USAGE: &str = "{} [OPTION]... FILE...";
 
 pub mod options {
     pub static DEREFERENCE: &str = "dereference";
@@ -97,7 +99,6 @@ pub mod options {
 
 static ARG_FILES: &str = "files";
 
-const MOUNT_INFO: &str = "/etc/mtab";
 pub const F_ALTER: u8 = 1;
 pub const F_ZERO: u8 = 1 << 1;
 pub const F_LEFT: u8 = 1 << 2;
@@ -193,11 +194,19 @@ impl ScanUtil for str {
 }
 
 pub fn group_num(s: &str) -> Cow<str> {
-    assert!(s.chars().all(char::is_numeric));
+    let is_negative = s.starts_with('-');
+    assert!(is_negative || s.chars().take(1).all(|c| c.is_digit(10)));
+    assert!(s.chars().skip(1).all(|c| c.is_digit(10)));
     if s.len() < 4 {
         return s.into();
     }
     let mut res = String::with_capacity((s.len() - 1) / 3);
+    let s = if is_negative {
+        res.push('-');
+        &s[1..]
+    } else {
+        s
+    };
     let mut alone = (s.len() - 1) % 3 + 1;
     res.push_str(&s[..alone]);
     while alone != s.len() {
@@ -210,7 +219,7 @@ pub fn group_num(s: &str) -> Cow<str> {
 
 pub struct Stater {
     follow: bool,
-    showfs: bool,
+    show_fs: bool,
     from_user: bool,
     files: Vec<String>,
     mount_list: Option<Vec<String>>,
@@ -219,7 +228,7 @@ pub struct Stater {
 }
 
 #[allow(clippy::cognitive_complexity)]
-fn print_it(arg: &str, otype: OutputType, flag: u8, width: usize, precision: i32) {
+fn print_it(arg: &str, output_type: &OutputType, flag: u8, width: usize, precision: i32) {
     // If the precision is given as just '.', the precision is taken to be zero.
     // A negative precision is taken as if the precision were omitted.
     // This gives the minimum number of digits to appear for d, i, o, u, x, and X conversions,
@@ -250,7 +259,7 @@ fn print_it(arg: &str, otype: OutputType, flag: u8, width: usize, precision: i32
     // By default, a sign  is  used only for negative numbers.
     // A + overrides a space if both are used.
 
-    if otype == OutputType::Unknown {
+    if output_type == &OutputType::Unknown {
         return print!("?");
     }
 
@@ -264,7 +273,7 @@ fn print_it(arg: &str, otype: OutputType, flag: u8, width: usize, precision: i32
     let has_sign = has!(flag, F_SIGN) || has!(flag, F_SPACE);
 
     let should_alter = has!(flag, F_ALTER);
-    let prefix = match otype {
+    let prefix = match output_type {
         OutputType::UnsignedOct => "0",
         OutputType::UnsignedHex => "0x",
         OutputType::Integer => {
@@ -277,7 +286,7 @@ fn print_it(arg: &str, otype: OutputType, flag: u8, width: usize, precision: i32
         _ => "",
     };
 
-    match otype {
+    match output_type {
         OutputType::Str => {
             let limit = cmp::min(precision, arg.len() as i32);
             let s: &str = if limit >= 0 {
@@ -336,10 +345,10 @@ fn print_it(arg: &str, otype: OutputType, flag: u8, width: usize, precision: i32
 }
 
 impl Stater {
-    pub fn generate_tokens(fmtstr: &str, use_printf: bool) -> Result<Vec<Token>, String> {
+    pub fn generate_tokens(format_str: &str, use_printf: bool) -> UResult<Vec<Token>> {
         let mut tokens = Vec::new();
-        let bound = fmtstr.len();
-        let chars = fmtstr.chars().collect::<Vec<char>>();
+        let bound = format_str.len();
+        let chars = format_str.chars().collect::<Vec<char>>();
         let mut i = 0_usize;
         while i < bound {
             match chars[i] {
@@ -372,32 +381,32 @@ impl Stater {
                         }
                         i += 1;
                     }
-                    check_bound!(fmtstr, bound, old, i);
+                    check_bound!(format_str, bound, old, i);
 
                     let mut width = 0_usize;
                     let mut precision = -1_i32;
                     let mut j = i;
 
-                    if let Some((field_width, offset)) = fmtstr[j..].scan_num::<usize>() {
+                    if let Some((field_width, offset)) = format_str[j..].scan_num::<usize>() {
                         width = field_width;
                         j += offset;
                     }
-                    check_bound!(fmtstr, bound, old, j);
+                    check_bound!(format_str, bound, old, j);
 
                     if chars[j] == '.' {
                         j += 1;
-                        check_bound!(fmtstr, bound, old, j);
+                        check_bound!(format_str, bound, old, j);
 
-                        match fmtstr[j..].scan_num::<i32>() {
-                            Some((prec, offset)) => {
-                                if prec >= 0 {
-                                    precision = prec;
+                        match format_str[j..].scan_num::<i32>() {
+                            Some((value, offset)) => {
+                                if value >= 0 {
+                                    precision = value;
                                 }
                                 j += offset;
                             }
                             None => precision = 0,
                         }
-                        check_bound!(fmtstr, bound, old, j);
+                        check_bound!(format_str, bound, old, j);
                     }
 
                     i = j;
@@ -406,7 +415,7 @@ impl Stater {
                         flag,
                         precision,
                         format: chars[i],
-                    })
+                    });
                 }
                 '\\' => {
                     if !use_printf {
@@ -420,7 +429,7 @@ impl Stater {
                         }
                         match chars[i] {
                             'x' if i + 1 < bound => {
-                                if let Some((c, offset)) = fmtstr[i + 1..].scan_char(16) {
+                                if let Some((c, offset)) = format_str[i + 1..].scan_char(16) {
                                     tokens.push(Token::Char(c));
                                     i += offset;
                                 } else {
@@ -429,7 +438,7 @@ impl Stater {
                                 }
                             }
                             '0'..='7' => {
-                                let (c, offset) = fmtstr[i..].scan_char(8).unwrap();
+                                let (c, offset) = format_str[i..].scan_char(8).unwrap();
                                 tokens.push(Token::Char(c));
                                 i += offset - 1;
                             }
@@ -441,6 +450,7 @@ impl Stater {
                             'f' => tokens.push(Token::Char('\x0C')),
                             'n' => tokens.push(Token::Char('\n')),
                             'r' => tokens.push(Token::Char('\r')),
+                            't' => tokens.push(Token::Char('\t')),
                             'v' => tokens.push(Token::Char('\x0B')),
                             c => {
                                 show_warning!("unrecognized escape '\\{}'", c);
@@ -454,19 +464,32 @@ impl Stater {
             }
             i += 1;
         }
-        if !use_printf && !fmtstr.ends_with('\n') {
+        if !use_printf && !format_str.ends_with('\n') {
             tokens.push(Token::Char('\n'));
         }
         Ok(tokens)
     }
 
-    fn new(matches: ArgMatches) -> Result<Stater, String> {
-        let files: Vec<String> = matches
+    fn new(matches: &ArgMatches) -> UResult<Self> {
+        let mut files: Vec<String> = matches
             .values_of(ARG_FILES)
             .map(|v| v.map(ToString::to_string).collect())
             .unwrap_or_default();
-
-        let fmtstr = if matches.is_present(options::PRINTF) {
+        #[cfg(unix)]
+        if files.contains(&String::from("-")) {
+            let redirected_path = Path::new("/dev/stdin")
+                .canonicalize()
+                .expect("unable to canonicalize /dev/stdin")
+                .into_os_string()
+                .into_string()
+                .unwrap();
+            for file in &mut files {
+                if file == "-" {
+                    *file = redirected_path.clone();
+                }
+            }
+        }
+        let format_str = if matches.is_present(options::PRINTF) {
             matches
                 .value_of(options::PRINTF)
                 .expect("Invalid format string")
@@ -476,27 +499,23 @@ impl Stater {
 
         let use_printf = matches.is_present(options::PRINTF);
         let terse = matches.is_present(options::TERSE);
-        let showfs = matches.is_present(options::FILE_SYSTEM);
+        let show_fs = matches.is_present(options::FILE_SYSTEM);
 
-        let default_tokens = if fmtstr.is_empty() {
-            Stater::generate_tokens(&Stater::default_fmt(showfs, terse, false), use_printf).unwrap()
+        let default_tokens = if format_str.is_empty() {
+            Self::generate_tokens(&Self::default_format(show_fs, terse, false), use_printf)?
         } else {
-            Stater::generate_tokens(&fmtstr, use_printf)?
+            Self::generate_tokens(format_str, use_printf)?
         };
         let default_dev_tokens =
-            Stater::generate_tokens(&Stater::default_fmt(showfs, terse, true), use_printf).unwrap();
+            Self::generate_tokens(&Self::default_format(show_fs, terse, true), use_printf)?;
 
-        let mount_list = if showfs {
+        let mount_list = if show_fs {
             // mount points aren't displayed when showing filesystem information
             None
         } else {
-            let reader = BufReader::new(
-                File::open(MOUNT_INFO).unwrap_or_else(|_| panic!("Failed to read {}", MOUNT_INFO)),
-            );
-            let mut mount_list = reader
-                .lines()
-                .filter_map(Result::ok)
-                .filter_map(|line| line.split_whitespace().nth(1).map(ToOwned::to_owned))
+            let mut mount_list = read_fs_list()
+                .iter()
+                .map(|mi| mi.mount_dir.clone())
                 .collect::<Vec<String>>();
             // Reverse sort. The longer comes first.
             mount_list.sort();
@@ -504,10 +523,10 @@ impl Stater {
             Some(mount_list)
         };
 
-        Ok(Stater {
+        Ok(Self {
             follow: matches.is_present(options::DEREFERENCE),
-            showfs,
-            from_user: !fmtstr.is_empty(),
+            show_fs,
+            from_user: !format_str.is_empty(),
             files,
             default_tokens,
             default_dev_tokens,
@@ -539,7 +558,7 @@ impl Stater {
     }
 
     fn do_stat(&self, file: &str) -> i32 {
-        if !self.showfs {
+        if !self.show_fs {
             let result = if self.follow {
                 fs::metadata(file)
             } else {
@@ -547,13 +566,14 @@ impl Stater {
             };
             match result {
                 Ok(meta) => {
-                    let ftype = meta.file_type();
-                    let tokens =
-                        if self.from_user || !(ftype.is_char_device() || ftype.is_block_device()) {
-                            &self.default_tokens
-                        } else {
-                            &self.default_dev_tokens
-                        };
+                    let file_type = meta.file_type();
+                    let tokens = if self.from_user
+                        || !(file_type.is_char_device() || file_type.is_block_device())
+                    {
+                        &self.default_tokens
+                    } else {
+                        &self.default_dev_tokens
+                    };
 
                     for t in tokens.iter() {
                         match *t {
@@ -565,91 +585,91 @@ impl Stater {
                                 format,
                             } => {
                                 let arg: String;
-                                let otype: OutputType;
+                                let output_type: OutputType;
 
                                 match format {
                                     // access rights in octal
                                     'a' => {
                                         arg = format!("{:o}", 0o7777 & meta.mode());
-                                        otype = OutputType::UnsignedOct;
+                                        output_type = OutputType::UnsignedOct;
                                     }
                                     // access rights in human readable form
                                     'A' => {
-                                        arg = pretty_access(meta.mode() as mode_t);
-                                        otype = OutputType::Str;
+                                        arg = display_permissions(&meta, true);
+                                        output_type = OutputType::Str;
                                     }
                                     // number of blocks allocated (see %B)
                                     'b' => {
                                         arg = format!("{}", meta.blocks());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
 
                                     // the size in bytes of each block reported by %b
                                     // FIXME: blocksize differs on various platform
-                                    // See coreutils/gnulib/lib/stat-size.h ST_NBLOCKSIZE
+                                    // See coreutils/gnulib/lib/stat-size.h ST_NBLOCKSIZE // spell-checker:disable-line
                                     'B' => {
                                         // the size in bytes of each block reported by %b
                                         arg = format!("{}", 512);
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
 
                                     // device number in decimal
                                     'd' => {
                                         arg = format!("{}", meta.dev());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // device number in hex
                                     'D' => {
                                         arg = format!("{:x}", meta.dev());
-                                        otype = OutputType::UnsignedHex;
+                                        output_type = OutputType::UnsignedHex;
                                     }
                                     // raw mode in hex
                                     'f' => {
                                         arg = format!("{:x}", meta.mode());
-                                        otype = OutputType::UnsignedHex;
+                                        output_type = OutputType::UnsignedHex;
                                     }
                                     // file type
                                     'F' => {
                                         arg = pretty_filetype(meta.mode() as mode_t, meta.len())
                                             .to_owned();
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // group ID of owner
                                     'g' => {
                                         arg = format!("{}", meta.gid());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // group name of owner
                                     'G' => {
                                         arg = entries::gid2grp(meta.gid())
                                             .unwrap_or_else(|_| "UNKNOWN".to_owned());
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // number of hard links
                                     'h' => {
                                         arg = format!("{}", meta.nlink());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // inode number
                                     'i' => {
                                         arg = format!("{}", meta.ino());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
 
                                     // mount point
                                     'm' => {
                                         arg = self.find_mount_point(file).unwrap();
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
 
                                     // file name
                                     'n' => {
                                         arg = file.to_owned();
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // quoted file name with dereference if symbolic link
                                     'N' => {
-                                        if ftype.is_symlink() {
+                                        if file_type.is_symlink() {
                                             let dst = match fs::read_link(file) {
                                                 Ok(path) => path,
                                                 Err(e) => {
@@ -657,105 +677,101 @@ impl Stater {
                                                     return 1;
                                                 }
                                             };
-                                            arg = format!(
-                                                "`{}' -> `{}'",
-                                                file,
-                                                dst.to_string_lossy()
-                                            );
+                                            arg = format!("{} -> {}", file.quote(), dst.quote());
                                         } else {
-                                            arg = format!("`{}'", file);
+                                            arg = file.to_string();
                                         }
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // optimal I/O transfer size hint
                                     'o' => {
                                         arg = format!("{}", meta.blksize());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // total size, in bytes
                                     's' => {
                                         arg = format!("{}", meta.len());
-                                        otype = OutputType::Integer;
+                                        output_type = OutputType::Integer;
                                     }
                                     // major device type in hex, for character/block device special
                                     // files
                                     't' => {
                                         arg = format!("{:x}", meta.rdev() >> 8);
-                                        otype = OutputType::UnsignedHex;
+                                        output_type = OutputType::UnsignedHex;
                                     }
                                     // minor device type in hex, for character/block device special
                                     // files
                                     'T' => {
                                         arg = format!("{:x}", meta.rdev() & 0xff);
-                                        otype = OutputType::UnsignedHex;
+                                        output_type = OutputType::UnsignedHex;
                                     }
                                     // user ID of owner
                                     'u' => {
                                         arg = format!("{}", meta.uid());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // user name of owner
                                     'U' => {
                                         arg = entries::uid2usr(meta.uid())
                                             .unwrap_or_else(|_| "UNKNOWN".to_owned());
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
 
                                     // time of file birth, human-readable; - if unknown
                                     'w' => {
                                         arg = meta.pretty_birth();
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
 
                                     // time of file birth, seconds since Epoch; 0 if unknown
                                     'W' => {
                                         arg = meta.birth();
-                                        otype = OutputType::Integer;
+                                        output_type = OutputType::Integer;
                                     }
 
                                     // time of last access, human-readable
                                     'x' => {
                                         arg = pretty_time(meta.atime(), meta.atime_nsec());
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // time of last access, seconds since Epoch
                                     'X' => {
                                         arg = format!("{}", meta.atime());
-                                        otype = OutputType::Integer;
+                                        output_type = OutputType::Integer;
                                     }
                                     // time of last data modification, human-readable
                                     'y' => {
                                         arg = pretty_time(meta.mtime(), meta.mtime_nsec());
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // time of last data modification, seconds since Epoch
                                     'Y' => {
                                         arg = format!("{}", meta.mtime());
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // time of last status change, human-readable
                                     'z' => {
                                         arg = pretty_time(meta.ctime(), meta.ctime_nsec());
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // time of last status change, seconds since Epoch
                                     'Z' => {
                                         arg = format!("{}", meta.ctime());
-                                        otype = OutputType::Integer;
+                                        output_type = OutputType::Integer;
                                     }
 
                                     _ => {
                                         arg = "?".to_owned();
-                                        otype = OutputType::Unknown;
+                                        output_type = OutputType::Unknown;
                                     }
                                 }
-                                print_it(&arg, otype, flag, width, precision);
+                                print_it(&arg, &output_type, flag, width, precision);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    show_info!("cannot stat '{}': {}", file, e);
+                    show_error!("cannot stat {}: {}", file.quote(), e);
                     return 1;
                 }
             }
@@ -774,81 +790,85 @@ impl Stater {
                                 format,
                             } => {
                                 let arg: String;
-                                let otype: OutputType;
+                                let output_type: OutputType;
                                 match format {
                                     // free blocks available to non-superuser
                                     'a' => {
                                         arg = format!("{}", meta.avail_blocks());
-                                        otype = OutputType::Integer;
+                                        output_type = OutputType::Integer;
                                     }
                                     // total data blocks in file system
                                     'b' => {
                                         arg = format!("{}", meta.total_blocks());
-                                        otype = OutputType::Integer;
+                                        output_type = OutputType::Integer;
                                     }
                                     // total file nodes in file system
                                     'c' => {
-                                        arg = format!("{}", meta.total_fnodes());
-                                        otype = OutputType::Unsigned;
+                                        arg = format!("{}", meta.total_file_nodes());
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // free file nodes in file system
                                     'd' => {
-                                        arg = format!("{}", meta.free_fnodes());
-                                        otype = OutputType::Integer;
+                                        arg = format!("{}", meta.free_file_nodes());
+                                        output_type = OutputType::Integer;
                                     }
                                     // free blocks in file system
                                     'f' => {
                                         arg = format!("{}", meta.free_blocks());
-                                        otype = OutputType::Integer;
+                                        output_type = OutputType::Integer;
                                     }
                                     // file system ID in hex
                                     'i' => {
                                         arg = format!("{:x}", meta.fsid());
-                                        otype = OutputType::UnsignedHex;
+                                        output_type = OutputType::UnsignedHex;
                                     }
                                     // maximum length of filenames
                                     'l' => {
                                         arg = format!("{}", meta.namelen());
-                                        otype = OutputType::Unsigned;
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // file name
                                     'n' => {
                                         arg = file.to_owned();
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     // block size (for faster transfers)
                                     's' => {
-                                        arg = format!("{}", meta.iosize());
-                                        otype = OutputType::Unsigned;
+                                        arg = format!("{}", meta.io_size());
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // fundamental block size (for block counts)
                                     'S' => {
-                                        arg = format!("{}", meta.blksize());
-                                        otype = OutputType::Unsigned;
+                                        arg = format!("{}", meta.block_size());
+                                        output_type = OutputType::Unsigned;
                                     }
                                     // file system type in hex
                                     't' => {
                                         arg = format!("{:x}", meta.fs_type());
-                                        otype = OutputType::UnsignedHex;
+                                        output_type = OutputType::UnsignedHex;
                                     }
                                     // file system type in human readable form
                                     'T' => {
                                         arg = pretty_fstype(meta.fs_type()).into_owned();
-                                        otype = OutputType::Str;
+                                        output_type = OutputType::Str;
                                     }
                                     _ => {
                                         arg = "?".to_owned();
-                                        otype = OutputType::Unknown;
+                                        output_type = OutputType::Unknown;
                                     }
                                 }
 
-                                print_it(&arg, otype, flag, width, precision);
+                                print_it(&arg, &output_type, flag, width, precision);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    show_info!("cannot read file system information for '{}': {}", file, e);
+                    show_error!(
+                        "cannot read file system information for {}: {}",
+                        file.quote(),
+                        e
+                    );
                     return 1;
                 }
             }
@@ -856,39 +876,35 @@ impl Stater {
         0
     }
 
-    // taken from coreutils/src/stat.c
-    fn default_fmt(showfs: bool, terse: bool, dev: bool) -> String {
+    fn default_format(show_fs: bool, terse: bool, show_dev_type: bool) -> String {
         // SELinux related format is *ignored*
 
-        let mut fmtstr = String::with_capacity(36);
-        if showfs {
+        let mut format_str = String::with_capacity(36);
+        if show_fs {
             if terse {
-                fmtstr.push_str("%n %i %l %t %s %S %b %f %a %c %d\n");
+                format_str.push_str("%n %i %l %t %s %S %b %f %a %c %d\n");
             } else {
-                fmtstr.push_str(
+                format_str.push_str(
                     "  File: \"%n\"\n    ID: %-8i Namelen: %-7l Type: %T\nBlock \
                      size: %-10s Fundamental block size: %S\nBlocks: Total: %-10b \
                      Free: %-10f Available: %a\nInodes: Total: %-10c Free: %d\n",
                 );
             }
         } else if terse {
-            fmtstr.push_str("%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o\n");
+            format_str.push_str("%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o\n");
         } else {
-            fmtstr.push_str("  File: %N\n  Size: %-10s\tBlocks: %-10b IO Block: %-6o %F\n");
-            if dev {
-                fmtstr.push_str("Device: %Dh/%dd\tInode: %-10i  Links: %-5h Device type: %t,%T\n");
+            format_str.push_str("  File: %N\n  Size: %-10s\tBlocks: %-10b IO Block: %-6o %F\n");
+            if show_dev_type {
+                format_str
+                    .push_str("Device: %Dh/%dd\tInode: %-10i  Links: %-5h Device type: %t,%T\n");
             } else {
-                fmtstr.push_str("Device: %Dh/%dd\tInode: %-10i  Links: %h\n");
+                format_str.push_str("Device: %Dh/%dd\tInode: %-10i  Links: %h\n");
             }
-            fmtstr.push_str("Access: (%04a/%10.10A)  Uid: (%5u/%8U)   Gid: (%5g/%8G)\n");
-            fmtstr.push_str("Access: %x\nModify: %y\nChange: %z\n Birth: %w\n");
+            format_str.push_str("Access: (%04a/%10.10A)  Uid: (%5u/%8U)   Gid: (%5g/%8G)\n");
+            format_str.push_str("Access: %x\nModify: %y\nChange: %z\n Birth: %w\n");
         }
-        fmtstr
+        format_str
     }
-}
-
-fn get_usage() -> String {
-    format!("{0} [OPTION]... FILE...", executable!())
 }
 
 fn get_long_usage() -> String {
@@ -949,36 +965,48 @@ for details about the options it supports.
     )
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let long_usage = get_long_usage();
 
-    let matches = App::new(executable!())
-        .version(VERSION)
+    let matches = uu_app().after_help(&long_usage[..]).get_matches_from(args);
+
+    let stater = Stater::new(&matches)?;
+    let exit_status = stater.exec();
+    if exit_status == 0 {
+        Ok(())
+    } else {
+        Err(exit_status.into())
+    }
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
         .about(ABOUT)
-        .usage(&usage[..])
-        .after_help(&long_usage[..])
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
         .arg(
-            Arg::with_name(options::DEREFERENCE)
-                .short("L")
+            Arg::new(options::DEREFERENCE)
+                .short('L')
                 .long(options::DEREFERENCE)
                 .help("follow links"),
         )
         .arg(
-            Arg::with_name(options::FILE_SYSTEM)
-                .short("f")
+            Arg::new(options::FILE_SYSTEM)
+                .short('f')
                 .long(options::FILE_SYSTEM)
                 .help("display file system status instead of file status"),
         )
         .arg(
-            Arg::with_name(options::TERSE)
-                .short("t")
+            Arg::new(options::TERSE)
+                .short('t')
                 .long(options::TERSE)
                 .help("print the information in terse form"),
         )
         .arg(
-            Arg::with_name(options::FORMAT)
-                .short("c")
+            Arg::new(options::FORMAT)
+                .short('c')
                 .long(options::FORMAT)
                 .help(
                     "use the specified FORMAT instead of the default;
@@ -987,7 +1015,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 .value_name("FORMAT"),
         )
         .arg(
-            Arg::with_name(options::PRINTF)
+            Arg::new(options::PRINTF)
                 .long(options::PRINTF)
                 .value_name("FORMAT")
                 .help(
@@ -997,18 +1025,9 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
                 ),
         )
         .arg(
-            Arg::with_name(ARG_FILES)
-                .multiple(true)
+            Arg::new(ARG_FILES)
+                .multiple_occurrences(true)
                 .takes_value(true)
                 .min_values(1),
         )
-        .get_matches_from(args);
-
-    match Stater::new(matches) {
-        Ok(stater) => stater.exec(),
-        Err(e) => {
-            show_info!("{}", e);
-            1
-        }
-    }
 }

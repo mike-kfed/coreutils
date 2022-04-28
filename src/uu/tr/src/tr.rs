@@ -1,245 +1,86 @@
 //  * This file is part of the uutils coreutils package.
 //  *
-//  * (c) Michael Gehring <mg@ebfe.org>
-//  * (c) kwantam <kwantam@gmail.com>
-//  *     * 2015-04-28 ~ created `expand` module to eliminate most allocs during setup
-//  * (c) Sergey "Shnatsel" Davidoff <shnatsel@gmail.com>
-//  *
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
 
 // spell-checker:ignore (ToDO) allocs bset dflag cflag sflag tflag
 
-#[macro_use]
-extern crate uucore;
+extern crate nom;
 
-mod expand;
+mod convert;
+mod operation;
+mod unicode_table;
 
-use bit_set::BitSet;
-use fnv::FnvHashMap;
-use getopts::Options;
-use std::io::{stdin, stdout, BufRead, BufWriter, Write};
+use clap::{crate_version, Arg, Command};
+use nom::AsBytes;
+use operation::{translate_input, Sequence, SqueezeOperation, TranslateOperation};
+use std::io::{stdin, stdout, BufReader, BufWriter};
+use uucore::{format_usage, show};
 
-use crate::expand::ExpandSet;
+use crate::operation::DeleteOperation;
+use uucore::error::{UResult, USimpleError, UUsageError};
+use uucore::{display::Quotable, InvalidEncodingHandling};
 
-static NAME: &str = "tr";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUFFER_LEN: usize = 1024;
+static ABOUT: &str = "translate or delete characters";
+const USAGE: &str = "{} [OPTION]... SET1 [SET2]";
 
-trait SymbolTranslator {
-    fn translate(&self, c: char, prev_c: char) -> Option<char>;
+mod options {
+    pub const COMPLEMENT: &str = "complement";
+    pub const DELETE: &str = "delete";
+    pub const SQUEEZE: &str = "squeeze-repeats";
+    pub const TRUNCATE_SET1: &str = "truncate-set1";
+    pub const SETS: &str = "sets";
 }
 
-struct DeleteOperation {
-    bset: BitSet,
-    complement: bool,
+fn get_long_usage() -> String {
+    "Translate, squeeze, and/or delete characters from standard input, \
+     writing to standard output."
+        .to_string()
 }
 
-impl DeleteOperation {
-    fn new(set: ExpandSet, complement: bool) -> DeleteOperation {
-        DeleteOperation {
-            bset: set.map(|c| c as usize).collect(),
-            complement,
-        }
-    }
-}
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
 
-impl SymbolTranslator for DeleteOperation {
-    fn translate(&self, c: char, _prev_c: char) -> Option<char> {
-        let uc = c as usize;
-        if self.complement == self.bset.contains(uc) {
-            Some(c)
-        } else {
-            None
-        }
-    }
-}
+    let after_help = get_long_usage();
 
-struct SqueezeOperation {
-    squeeze_set: BitSet,
-    complement: bool,
-}
+    let matches = uu_app().after_help(&after_help[..]).get_matches_from(args);
 
-impl SqueezeOperation {
-    fn new(squeeze_set: ExpandSet, complement: bool) -> SqueezeOperation {
-        SqueezeOperation {
-            squeeze_set: squeeze_set.map(|c| c as usize).collect(),
-            complement,
-        }
-    }
-}
+    let delete_flag = matches.is_present(options::DELETE);
+    let complement_flag = matches.is_present(options::COMPLEMENT);
+    let squeeze_flag = matches.is_present(options::SQUEEZE);
+    let truncate_set1_flag = matches.is_present(options::TRUNCATE_SET1);
 
-impl SymbolTranslator for SqueezeOperation {
-    fn translate(&self, c: char, prev_c: char) -> Option<char> {
-        if prev_c == c && self.complement != self.squeeze_set.contains(c as usize) {
-            None
-        } else {
-            Some(c)
-        }
-    }
-}
-
-struct DeleteAndSqueezeOperation {
-    delete_set: BitSet,
-    squeeze_set: BitSet,
-    complement: bool,
-}
-
-impl DeleteAndSqueezeOperation {
-    fn new(
-        delete_set: ExpandSet,
-        squeeze_set: ExpandSet,
-        complement: bool,
-    ) -> DeleteAndSqueezeOperation {
-        DeleteAndSqueezeOperation {
-            delete_set: delete_set.map(|c| c as usize).collect(),
-            squeeze_set: squeeze_set.map(|c| c as usize).collect(),
-            complement,
-        }
-    }
-}
-
-impl SymbolTranslator for DeleteAndSqueezeOperation {
-    fn translate(&self, c: char, prev_c: char) -> Option<char> {
-        if self.complement != self.delete_set.contains(c as usize)
-            || prev_c == c && self.squeeze_set.contains(c as usize)
-        {
-            None
-        } else {
-            Some(c)
-        }
-    }
-}
-
-struct TranslateOperation {
-    translate_map: FnvHashMap<usize, char>,
-}
-
-impl TranslateOperation {
-    fn new(set1: ExpandSet, set2: &mut ExpandSet, truncate: bool) -> TranslateOperation {
-        let mut map = FnvHashMap::default();
-        let mut s2_prev = '_';
-        for i in set1 {
-            let s2_next = set2.next();
-
-            if s2_next.is_none() && truncate {
-                map.insert(i as usize, i);
-            } else {
-                s2_prev = s2_next.unwrap_or(s2_prev);
-                map.insert(i as usize, s2_prev);
-            }
-        }
-        TranslateOperation { translate_map: map }
-    }
-}
-
-impl SymbolTranslator for TranslateOperation {
-    fn translate(&self, c: char, _prev_c: char) -> Option<char> {
-        Some(*self.translate_map.get(&(c as usize)).unwrap_or(&c))
-    }
-}
-
-fn translate_input<T: SymbolTranslator>(
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
-    translator: T,
-) {
-    let mut buf = String::with_capacity(BUFFER_LEN + 4);
-    let mut output_buf = String::with_capacity(BUFFER_LEN + 4);
-
-    while let Ok(length) = input.read_line(&mut buf) {
-        let mut prev_c = 0 as char;
-        if length == 0 {
-            break;
-        }
-        {
-            // isolation to make borrow checker happy
-            let filtered = buf.chars().filter_map(|c| {
-                let res = translator.translate(c, prev_c);
-                if res.is_some() {
-                    prev_c = c;
-                }
-                res
-            });
-
-            output_buf.extend(filtered);
-            output.write_all(output_buf.as_bytes()).unwrap();
-        }
-        buf.clear();
-        output_buf.clear();
-    }
-}
-
-fn usage(opts: &Options) {
-    println!("{} {}", NAME, VERSION);
-    println!();
-    println!("Usage:");
-    println!("  {} [OPTIONS] SET1 [SET2]", NAME);
-    println!();
-    println!("{}", opts.usage("Translate or delete characters."));
-}
-
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
-
-    let mut opts = Options::new();
-
-    opts.optflag("c", "complement", "use the complement of SET1");
-    opts.optflag("C", "", "same as -c");
-    opts.optflag("d", "delete", "delete characters in SET1");
-    opts.optflag("h", "help", "display this help and exit");
-    opts.optflag("s", "squeeze", "replace each sequence of a repeated character that is listed in the last specified SET, with a single occurrence of that character");
-    opts.optflag(
-        "t",
-        "truncate-set1",
-        "first truncate SET1 to length of SET2",
-    );
-    opts.optflag("V", "version", "output version information and exit");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(err) => {
-            show_error!("{}", err);
-            return 1;
-        }
-    };
-
-    if matches.opt_present("help") {
-        usage(&opts);
-        return 0;
-    }
-
-    if matches.opt_present("version") {
-        println!("{} {}", NAME, VERSION);
-        return 0;
-    }
-
-    let dflag = matches.opt_present("d");
-    let cflag = matches.opts_present(&["c".to_owned(), "C".to_owned()]);
-    let sflag = matches.opt_present("s");
-    let tflag = matches.opt_present("t");
-    let sets = matches.free;
+    let sets = matches
+        .values_of(options::SETS)
+        .map(|v| {
+            v.map(ToString::to_string)
+                .map(|input| convert::reduce_octal_to_char(&input))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let sets_len = sets.len();
 
     if sets.is_empty() {
-        show_error!(
-            "missing operand\nTry `{} --help` for more information.",
-            NAME
-        );
-        return 1;
+        return Err(UUsageError::new(1, "missing operand"));
     }
 
-    if !(dflag || sflag) && sets.len() < 2 {
-        show_error!(
-            "missing operand after ‘{}’\nTry `{} --help` for more information.",
-            sets[0],
-            NAME
-        );
-        return 1;
+    if !(delete_flag || squeeze_flag) && sets_len < 2 {
+        return Err(UUsageError::new(
+            1,
+            format!("missing operand after {}", sets[0].quote()),
+        ));
     }
 
-    if cflag && !dflag && !sflag {
-        show_error!("-c is only supported with -d or -s");
-        return 1;
+    if let Some(first) = sets.get(0) {
+        if first.ends_with('\\') {
+            show!(USimpleError::new(
+                0,
+                "warning: an unescaped backslash at end of string is not portable"
+            ));
+        }
     }
 
     let stdin = stdin();
@@ -248,24 +89,95 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     let locked_stdout = stdout.lock();
     let mut buffered_stdout = BufWriter::new(locked_stdout);
 
-    let set1 = ExpandSet::new(sets[0].as_ref());
-    if dflag {
-        if sflag {
-            let set2 = ExpandSet::new(sets[1].as_ref());
-            let op = DeleteAndSqueezeOperation::new(set1, set2, cflag);
-            translate_input(&mut locked_stdin, &mut buffered_stdout, op);
+    let mut sets_iter = sets.iter().map(|c| c.as_str());
+    let (set1, set2) = Sequence::solve_set_characters(
+        sets_iter.next().unwrap_or_default(),
+        sets_iter.next().unwrap_or_default(),
+        truncate_set1_flag,
+    )?;
+
+    if delete_flag {
+        if squeeze_flag {
+            let mut delete_buffer = vec![];
+            {
+                let mut delete_writer = BufWriter::new(&mut delete_buffer);
+                let delete_op = DeleteOperation::new(set1, complement_flag);
+                translate_input(&mut locked_stdin, &mut delete_writer, delete_op);
+            }
+            {
+                let mut squeeze_reader = BufReader::new(delete_buffer.as_bytes());
+                let op = SqueezeOperation::new(set2, complement_flag);
+                translate_input(&mut squeeze_reader, &mut buffered_stdout, op);
+            }
         } else {
-            let op = DeleteOperation::new(set1, cflag);
+            let op = DeleteOperation::new(set1, complement_flag);
             translate_input(&mut locked_stdin, &mut buffered_stdout, op);
         }
-    } else if sflag {
-        let op = SqueezeOperation::new(set1, cflag);
-        translate_input(&mut locked_stdin, &mut buffered_stdout, op);
+    } else if squeeze_flag {
+        if sets_len < 2 {
+            let op = SqueezeOperation::new(set1, complement_flag);
+            translate_input(&mut locked_stdin, &mut buffered_stdout, op);
+        } else {
+            let mut translate_buffer = vec![];
+            {
+                let mut writer = BufWriter::new(&mut translate_buffer);
+                let op = TranslateOperation::new(set1, set2.clone(), complement_flag)?;
+                translate_input(&mut locked_stdin, &mut writer, op);
+            }
+            {
+                let mut reader = BufReader::new(translate_buffer.as_bytes());
+                let squeeze_op = SqueezeOperation::new(set2, false);
+                translate_input(&mut reader, &mut buffered_stdout, squeeze_op);
+            }
+        }
     } else {
-        let mut set2 = ExpandSet::new(sets[1].as_ref());
-        let op = TranslateOperation::new(set1, &mut set2, tflag);
-        translate_input(&mut locked_stdin, &mut buffered_stdout, op)
+        let op = TranslateOperation::new(set1, set2, complement_flag)?;
+        translate_input(&mut locked_stdin, &mut buffered_stdout, op);
     }
+    Ok(())
+}
 
-    0
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::COMPLEMENT)
+                .visible_short_alias('C')
+                .short('c')
+                .long(options::COMPLEMENT)
+                .help("use the complement of SET1"),
+        )
+        .arg(
+            Arg::new(options::DELETE)
+                .short('d')
+                .long(options::DELETE)
+                .help("delete characters in SET1, do not translate"),
+        )
+        .arg(
+            Arg::new(options::SQUEEZE)
+                .long(options::SQUEEZE)
+                .short('s')
+                .help(
+                    "replace each sequence of a repeated character that is \
+                     listed in the last specified SET, with a single occurrence \
+                     of that character",
+                ),
+        )
+        .arg(
+            Arg::new(options::TRUNCATE_SET1)
+                .long(options::TRUNCATE_SET1)
+                .short('t')
+                .help("first truncate SET1 to length of SET2"),
+        )
+        .arg(
+            Arg::new(options::SETS)
+                .multiple_occurrences(true)
+                .takes_value(true)
+                .min_values(1)
+                .max_values(2),
+        )
 }

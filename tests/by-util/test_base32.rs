@@ -14,13 +14,28 @@ fn test_encode() {
     new_ucmd!()
         .pipe_in(input)
         .succeeds()
-        .stdout_only("JBSWY3DPFQQFO33SNRSCC===\n");
+        .stdout_only("JBSWY3DPFQQFO33SNRSCC===\n"); // spell-checker:disable-line
+
+    // Using '-' as our file
+    new_ucmd!()
+        .arg("-")
+        .pipe_in(input)
+        .succeeds()
+        .stdout_only("JBSWY3DPFQQFO33SNRSCC===\n"); // spell-checker:disable-line
+}
+
+#[test]
+fn test_base32_encode_file() {
+    new_ucmd!()
+        .arg("input-simple.txt")
+        .succeeds()
+        .stdout_only("JBSWY3DPFQQFO33SNRSCCCQ=\n"); // spell-checker:disable-line
 }
 
 #[test]
 fn test_decode() {
-    for decode_param in vec!["-d", "--decode"] {
-        let input = "JBSWY3DPFQQFO33SNRSCC===\n";
+    for decode_param in ["-d", "--decode", "--dec"] {
+        let input = "JBSWY3DPFQQFO33SNRSCC===\n"; // spell-checker:disable-line
         new_ucmd!()
             .arg(decode_param)
             .pipe_in(input)
@@ -31,7 +46,7 @@ fn test_decode() {
 
 #[test]
 fn test_garbage() {
-    let input = "aGVsbG8sIHdvcmxkIQ==\0";
+    let input = "aGVsbG8sIHdvcmxkIQ==\0"; // spell-checker:disable-line
     new_ucmd!()
         .arg("-d")
         .pipe_in(input)
@@ -41,8 +56,8 @@ fn test_garbage() {
 
 #[test]
 fn test_ignore_garbage() {
-    for ignore_garbage_param in vec!["-i", "--ignore-garbage"] {
-        let input = "JBSWY\x013DPFQ\x02QFO33SNRSCC===\n";
+    for ignore_garbage_param in ["-i", "--ignore-garbage", "--ig"] {
+        let input = "JBSWY\x013DPFQ\x02QFO33SNRSCC===\n"; // spell-checker:disable-line
         new_ucmd!()
             .arg("-d")
             .arg(ignore_garbage_param)
@@ -54,7 +69,7 @@ fn test_ignore_garbage() {
 
 #[test]
 fn test_wrap() {
-    for wrap_param in vec!["-w", "--wrap"] {
+    for wrap_param in ["-w", "--wrap", "--wr"] {
         let input = "The quick brown fox jumps over the lazy dog.";
         new_ucmd!()
             .arg(wrap_param)
@@ -62,28 +77,54 @@ fn test_wrap() {
             .pipe_in(input)
             .succeeds()
             .stdout_only(
-                "KRUGKIDROVUWG2ZAMJZG\n653OEBTG66BANJ2W24DT\nEBXXMZLSEB2GQZJANRQX\nU6JAMRXWOLQ=\n",
+                "KRUGKIDROVUWG2ZAMJZG\n653OEBTG66BANJ2W24DT\nEBXXMZLSEB2GQZJANRQX\nU6JAMRXWOLQ=\n", // spell-checker:disable-line
             );
     }
 }
 
 #[test]
 fn test_wrap_no_arg() {
-    for wrap_param in vec!["-w", "--wrap"] {
-        new_ucmd!().arg(wrap_param).fails().stderr_only(format!(
-            "base32: error: Argument to option '{}' missing\n",
-            if wrap_param == "-w" { "w" } else { "wrap" }
-        ));
+    for wrap_param in ["-w", "--wrap"] {
+        let ts = TestScenario::new(util_name!());
+        let expected_stderr = &format!(
+            "error: The argument '--wrap <wrap>\' requires a value but none was \
+                               supplied\n\nUSAGE:\n    {1} {0} [OPTION]... [FILE]\n\nFor more \
+                               information try --help",
+            ts.util_name,
+            ts.bin_path.to_string_lossy()
+        );
+        ts.ucmd()
+            .arg(wrap_param)
+            .fails()
+            .stderr_only(expected_stderr);
     }
 }
 
 #[test]
 fn test_wrap_bad_arg() {
-    for wrap_param in vec!["-w", "--wrap"] {
+    for wrap_param in ["-w", "--wrap"] {
         new_ucmd!()
             .arg(wrap_param)
             .arg("b")
             .fails()
-            .stderr_only("base32: error: invalid wrap size: ‘b’: invalid digit found in string\n");
+            .stderr_only("base32: invalid wrap size: 'b'\n");
     }
+}
+
+#[test]
+fn test_base32_extra_operand() {
+    // Expect a failure when multiple files are specified.
+    new_ucmd!()
+        .arg("a.txt")
+        .arg("b.txt")
+        .fails()
+        .usage_error("extra operand 'b.txt'");
+}
+
+#[test]
+fn test_base32_file_not_found() {
+    new_ucmd!()
+        .arg("a.txt")
+        .fails()
+        .stderr_only("base32: a.txt: No such file or directory");
 }

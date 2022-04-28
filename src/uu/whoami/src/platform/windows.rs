@@ -7,24 +7,21 @@
  * file that was distributed with this source code.
  */
 
-// spell-checker:ignore (ToDO) advapi lmcons winnt getusername WCHAR UNLEN
+use std::ffi::OsString;
+use std::io;
+use std::os::windows::ffi::OsStringExt;
 
-extern crate winapi;
+use winapi::shared::lmcons;
+use winapi::shared::minwindef::DWORD;
+use winapi::um::winbase;
 
-use self::winapi::shared::lmcons;
-use self::winapi::shared::minwindef;
-use self::winapi::um::winnt;
-use std::io::{Error, Result};
-use std::mem;
-use uucore::wide::FromWide;
-
-pub unsafe fn getusername() -> Result<String> {
-    #[allow(deprecated)]
-    let mut buffer: [winnt::WCHAR; lmcons::UNLEN as usize + 1] = mem::uninitialized();
-    let mut len = buffer.len() as minwindef::DWORD;
-    if advapi32::GetUserNameW(buffer.as_mut_ptr(), &mut len) == 0 {
-        return Err(Error::last_os_error());
+pub fn get_username() -> io::Result<OsString> {
+    const BUF_LEN: DWORD = lmcons::UNLEN + 1;
+    let mut buffer = [0_u16; BUF_LEN as usize];
+    let mut len = BUF_LEN;
+    // SAFETY: buffer.len() == len
+    if unsafe { winbase::GetUserNameW(buffer.as_mut_ptr(), &mut len) } == 0 {
+        return Err(io::Error::last_os_error());
     }
-    let username = String::from_wide(&buffer[..len as usize - 1]);
-    Ok(username)
+    Ok(OsString::from_wide(&buffer[..len as usize - 1]))
 }

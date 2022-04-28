@@ -1,5 +1,4 @@
-#[cfg(not(windows))]
-use std::fs;
+// spell-checker:ignore (words) bamf chdir rlimit prlimit COMSPEC
 
 use crate::common::util::*;
 use std::env;
@@ -8,45 +7,36 @@ use tempfile::tempdir;
 
 #[test]
 fn test_env_help() {
-    assert!(new_ucmd!()
+    new_ucmd!()
         .arg("--help")
         .succeeds()
         .no_stderr()
-        .stdout
-        .contains("OPTIONS:"));
+        .stdout_contains("OPTIONS:");
 }
 
 #[test]
 fn test_env_version() {
-    assert!(new_ucmd!()
+    new_ucmd!()
         .arg("--version")
         .succeeds()
         .no_stderr()
-        .stdout
-        .contains(util_name!()));
+        .stdout_contains(util_name!());
 }
 
 #[test]
 fn test_echo() {
-    // assert!(new_ucmd!().arg("printf").arg("FOO-bar").succeeds().no_stderr().stdout.contains("FOO-bar"));
-    let mut cmd = new_ucmd!();
-    cmd.arg("echo").arg("FOO-bar");
-    println!("cmd={:?}", cmd);
+    let result = new_ucmd!().arg("echo").arg("FOO-bar").succeeds();
 
-    let result = cmd.run();
-    println!("success={:?}", result.success);
-    println!("stdout={:?}", result.stdout);
-    println!("stderr={:?}", result.stderr);
-    assert!(result.success);
-
-    let out = result.stdout.trim_end();
-
-    assert_eq!(out, "FOO-bar");
+    assert_eq!(result.stdout_str().trim(), "FOO-bar");
 }
 
 #[test]
 fn test_file_option() {
-    let out = new_ucmd!().arg("-f").arg("vars.conf.txt").run().stdout;
+    let out = new_ucmd!()
+        .arg("-f")
+        .arg("vars.conf.txt")
+        .run()
+        .stdout_move_str();
 
     assert_eq!(
         out.lines()
@@ -63,7 +53,7 @@ fn test_combined_file_set() {
         .arg("vars.conf.txt")
         .arg("FOO=bar.alt")
         .run()
-        .stdout;
+        .stdout_move_str();
 
     assert_eq!(out.lines().filter(|&line| line == "FOO=bar.alt").count(), 1);
 }
@@ -76,8 +66,8 @@ fn test_combined_file_set_unset() {
         .arg("-f")
         .arg("vars.conf.txt")
         .arg("FOO=bar.alt")
-        .run()
-        .stdout;
+        .succeeds()
+        .stdout_move_str();
 
     assert_eq!(
         out.lines()
@@ -88,18 +78,33 @@ fn test_combined_file_set_unset() {
 }
 
 #[test]
-fn test_single_name_value_pair() {
-    let out = new_ucmd!().arg("FOO=bar").run().stdout;
+fn test_unset_invalid_variables() {
+    use uucore::display::Quotable;
 
-    assert!(out.lines().any(|line| line == "FOO=bar"));
+    // Cannot test input with \0 in it, since output will also contain \0. rlimit::prlimit fails
+    // with this error: Error { kind: InvalidInput, message: "nul byte found in provided data" }
+    for var in ["", "a=b"] {
+        new_ucmd!().arg("-u").arg(var).run().stderr_only(format!(
+            "env: cannot unset {}: Invalid argument",
+            var.quote()
+        ));
+    }
+}
+
+#[test]
+fn test_single_name_value_pair() {
+    let out = new_ucmd!().arg("FOO=bar").run();
+
+    assert!(out.stdout_str().lines().any(|line| line == "FOO=bar"));
 }
 
 #[test]
 fn test_multiple_name_value_pairs() {
-    let out = new_ucmd!().arg("FOO=bar").arg("ABC=xyz").run().stdout;
+    let out = new_ucmd!().arg("FOO=bar").arg("ABC=xyz").run();
 
     assert_eq!(
-        out.lines()
+        out.stdout_str()
+            .lines()
             .filter(|&line| line == "FOO=bar" || line == "ABC=xyz")
             .count(),
         2
@@ -110,13 +115,17 @@ fn test_multiple_name_value_pairs() {
 fn test_ignore_environment() {
     let scene = TestScenario::new(util_name!());
 
-    let out = scene.ucmd().arg("-i").run().stdout;
+    scene.ucmd().arg("-i").run().no_stdout();
+    scene.ucmd().arg("-").run().no_stdout();
+}
 
-    assert_eq!(out, "");
-
-    let out = scene.ucmd().arg("-").run().stdout;
-
-    assert_eq!(out, "");
+#[test]
+fn test_empty_name() {
+    new_ucmd!()
+        .arg("-i")
+        .arg("=xyz")
+        .run()
+        .stderr_only("env: warning: no name specified for value 'xyz'");
 }
 
 #[test]
@@ -126,12 +135,12 @@ fn test_null_delimiter() {
         .arg("--null")
         .arg("FOO=bar")
         .arg("ABC=xyz")
-        .run()
-        .stdout;
+        .succeeds()
+        .stdout_move_str();
 
     let mut vars: Vec<_> = out.split('\0').collect();
     assert_eq!(vars.len(), 3);
-    vars.sort();
+    vars.sort_unstable();
     assert_eq!(vars[0], "");
     assert_eq!(vars[1], "ABC=xyz");
     assert_eq!(vars[2], "FOO=bar");
@@ -145,16 +154,19 @@ fn test_unset_variable() {
         .ucmd_keepenv()
         .arg("-u")
         .arg("HOME")
-        .run()
-        .stdout;
+        .succeeds()
+        .stdout_move_str();
 
-    assert_eq!(out.lines().any(|line| line.starts_with("HOME=")), false);
+    assert!(!out.lines().any(|line| line.starts_with("HOME=")));
 }
 
 #[test]
 fn test_fail_null_with_program() {
-    let out = new_ucmd!().arg("--null").arg("cd").fails().stderr;
-    assert!(out.contains("cannot specify --null (-0) with command"));
+    new_ucmd!()
+        .arg("--null")
+        .arg("cd")
+        .fails()
+        .stderr_contains("cannot specify --null (-0) with command");
 }
 
 #[cfg(not(windows))]
@@ -162,7 +174,7 @@ fn test_fail_null_with_program() {
 fn test_change_directory() {
     let scene = TestScenario::new(util_name!());
     let temporary_directory = tempdir().unwrap();
-    let temporary_path = fs::canonicalize(temporary_directory.path()).unwrap();
+    let temporary_path = std::fs::canonicalize(temporary_directory.path()).unwrap();
     assert_ne!(env::current_dir().unwrap(), temporary_path);
 
     // command to print out current working directory
@@ -173,40 +185,48 @@ fn test_change_directory() {
         .arg("--chdir")
         .arg(&temporary_path)
         .arg(pwd)
-        .run()
-        .stdout;
-    assert_eq!(out.trim(), temporary_path.as_os_str())
+        .succeeds()
+        .stdout_move_str();
+    assert_eq!(out.trim(), temporary_path.as_os_str());
 }
 
-// no way to consistently get "current working directory", `cd` doesn't work @ CI
-// instead, we test that the unique temporary directory appears somewhere in the printed variables
 #[cfg(windows)]
 #[test]
 fn test_change_directory() {
     let scene = TestScenario::new(util_name!());
     let temporary_directory = tempdir().unwrap();
-    let temporary_path = temporary_directory.path();
 
-    assert_ne!(env::current_dir().unwrap(), temporary_path);
+    let temporary_path = temporary_directory.path();
+    let temporary_path = temporary_path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(temporary_path);
+
+    let env_cd = env::current_dir().unwrap();
+    let env_cd = env_cd.strip_prefix(r"\\?\").unwrap_or(&env_cd);
+
+    assert_ne!(env_cd, temporary_path);
+
+    // COMSPEC is a variable that contains the full path to cmd.exe
+    let cmd_path = env::var("COMSPEC").unwrap();
+
+    // command to print out current working directory
+    let pwd = [&*cmd_path, "/C", "cd"];
 
     let out = scene
         .ucmd()
         .arg("--chdir")
         .arg(&temporary_path)
-        .run()
-        .stdout;
-    assert_eq!(
-        out.lines()
-            .any(|line| line.ends_with(temporary_path.file_name().unwrap().to_str().unwrap())),
-        false
-    );
+        .args(&pwd)
+        .succeeds()
+        .stdout_move_str();
+    assert_eq!(out.trim(), temporary_path.as_os_str());
 }
 
 #[test]
 fn test_fail_change_directory() {
     let scene = TestScenario::new(util_name!());
     let some_non_existing_path = "some_nonexistent_path";
-    assert_eq!(Path::new(some_non_existing_path).is_dir(), false);
+    assert!(!Path::new(some_non_existing_path).is_dir());
 
     let out = scene
         .ucmd()
@@ -214,6 +234,6 @@ fn test_fail_change_directory() {
         .arg(some_non_existing_path)
         .arg("pwd")
         .fails()
-        .stderr;
+        .stderr_move_str();
     assert!(out.contains("env: cannot change directory to "));
 }

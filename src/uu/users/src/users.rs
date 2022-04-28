@@ -6,49 +6,46 @@
 //  * For the full copyright and license information, please view the LICENSE
 //  * file that was distributed with this source code.
 
-/* last synced with: whoami (GNU coreutils) 8.22 */
-// Allow dead code here in order to keep all fields, constants here, for consistency.
-#![allow(dead_code)]
+// spell-checker:ignore (paths) wtmp
 
-#[macro_use]
-extern crate uucore;
+use std::path::Path;
 
-use uucore::utmpx::*;
+use clap::{crate_version, Arg, Command};
+use uucore::error::UResult;
+use uucore::format_usage;
+use uucore::utmpx::{self, Utmpx};
 
-use clap::{App, Arg};
-
-static ABOUT: &str = "Display who is currently logged in, according to FILE.";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+static ABOUT: &str = "Print the user names of users currently logged in to the current host";
+const USAGE: &str = "{} [FILE]";
 
 static ARG_FILES: &str = "files";
 
-fn get_usage() -> String {
-    format!("{0} [FILE]", executable!())
+fn get_long_usage() -> String {
+    format!(
+        "Output who is currently logged in according to FILE.
+If FILE is not specified, use {}.  /var/log/wtmp as FILE is common.",
+        utmpx::DEFAULT_FILE
+    )
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let usage = get_usage();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let after_help = get_long_usage();
 
-    let matches = App::new(executable!())
-        .version(VERSION)
-        .about(ABOUT)
-        .usage(&usage[..])
-        .arg(Arg::with_name(ARG_FILES).takes_value(true).max_values(1))
-        .get_matches_from(args);
+    let matches = uu_app().after_help(&after_help[..]).get_matches_from(args);
 
-    let files: Vec<String> = matches
-        .values_of(ARG_FILES)
-        .map(|v| v.map(ToString::to_string).collect())
+    let files: Vec<&Path> = matches
+        .values_of_os(ARG_FILES)
+        .map(|v| v.map(AsRef::as_ref).collect())
         .unwrap_or_default();
 
     let filename = if !files.is_empty() {
-        files[0].as_ref()
+        files[0]
     } else {
-        DEFAULT_FILE
+        utmpx::DEFAULT_FILE.as_ref()
     };
 
-    let mut users = Utmpx::iter_all_records()
-        .read_from(filename)
+    let mut users = Utmpx::iter_all_records_from(filename)
         .filter(Utmpx::is_user_process)
         .map(|ut| ut.user())
         .collect::<Vec<_>>();
@@ -58,5 +55,14 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         println!("{}", users.join(" "));
     }
 
-    0
+    Ok(())
+}
+
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(Arg::new(ARG_FILES).takes_value(true).max_values(1))
 }

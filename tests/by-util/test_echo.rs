@@ -1,23 +1,20 @@
+// spell-checker:ignore (words) araba merci
+
 use crate::common::util::*;
 
 #[test]
 fn test_default() {
-    //CmdResult.stdout_only(...) trims trailing newlines
-    assert_eq!("hi\n", new_ucmd!().arg("hi").succeeds().no_stderr().stdout);
+    new_ucmd!().arg("hi").succeeds().stdout_only("hi\n");
 }
 
 #[test]
 fn test_no_trailing_newline() {
-    //CmdResult.stdout_only(...) trims trailing newlines
-    assert_eq!(
-        "hi",
-        new_ucmd!()
-            .arg("-n")
-            .arg("hi")
-            .succeeds()
-            .no_stderr()
-            .stdout
-    );
+    new_ucmd!()
+        .arg("-n")
+        .arg("hi")
+        .succeeds()
+        .no_stderr()
+        .stdout_only("hi");
 }
 
 #[test]
@@ -141,11 +138,19 @@ fn test_escape_short_octal() {
 }
 
 #[test]
-fn test_escape_no_octal() {
+fn test_escape_nul() {
     new_ucmd!()
         .args(&["-e", "foo\\0 bar"])
         .succeeds()
-        .stdout_only("foo\\0 bar\n");
+        .stdout_only("foo\0 bar\n");
+}
+
+#[test]
+fn test_escape_octal_invalid_digit() {
+    new_ucmd!()
+        .args(&["-e", "foo\\08 bar"])
+        .succeeds()
+        .stdout_only("foo\u{0}8 bar\n");
 }
 
 #[test]
@@ -172,4 +177,58 @@ fn test_disable_escapes() {
         .arg(input_str)
         .succeeds()
         .stdout_only(format!("{}\n", input_str));
+}
+
+#[test]
+fn test_hyphen_value() {
+    new_ucmd!().arg("-abc").succeeds().stdout_is("-abc\n");
+}
+
+#[test]
+fn test_multiple_hyphen_values() {
+    new_ucmd!()
+        .args(&["-abc", "-def", "-edf"])
+        .succeeds()
+        .stdout_is("-abc -def -edf\n");
+}
+
+#[test]
+fn test_hyphen_values_inside_string() {
+    new_ucmd!()
+        .arg("'\"\n'CXXFLAGS=-g -O2'\n\"'") // spell-checker:disable-line
+        .succeeds()
+        .stdout_contains("CXXFLAGS"); // spell-checker:disable-line
+}
+
+#[test]
+fn test_hyphen_values_at_start() {
+    new_ucmd!()
+        .arg("-E")
+        .arg("-test")
+        .arg("araba")
+        .arg("-merci")
+        .run()
+        .success()
+        .stdout_does_not_contain("-E")
+        .stdout_is("-test araba -merci\n");
+}
+
+#[test]
+fn test_hyphen_values_between() {
+    new_ucmd!()
+        .arg("test")
+        .arg("-E")
+        .arg("araba")
+        .run()
+        .success()
+        .stdout_is("test -E araba\n");
+
+    new_ucmd!()
+        .arg("dumdum ")
+        .arg("dum dum dum")
+        .arg("-e")
+        .arg("dum")
+        .run()
+        .success()
+        .stdout_is("dumdum  dum dum dum -e dum\n");
 }

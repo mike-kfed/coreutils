@@ -43,12 +43,12 @@ fn escaped_octal() {
 }
 
 #[test]
-fn escaped_unicode_fourdigit() {
+fn escaped_unicode_four_digit() {
     new_ucmd!().args(&["\\u0125"]).succeeds().stdout_only("ĥ");
 }
 
 #[test]
-fn escaped_unicode_eightdigit() {
+fn escaped_unicode_eight_digit() {
     new_ucmd!()
         .args(&["\\U00000125"])
         .succeeds()
@@ -77,7 +77,7 @@ fn sub_string() {
 }
 
 #[test]
-fn sub_multifield() {
+fn sub_multi_field() {
     new_ucmd!()
         .args(&["%s %s", "hello", "world"])
         .succeeds()
@@ -85,7 +85,7 @@ fn sub_multifield() {
 }
 
 #[test]
-fn sub_repeat_formatstr() {
+fn sub_repeat_format_str() {
     new_ucmd!()
         .args(&["%s.", "hello", "world"])
         .succeeds()
@@ -101,7 +101,7 @@ fn sub_string_ignore_escapes() {
 }
 
 #[test]
-fn sub_bstring_handle_escapes() {
+fn sub_b_string_handle_escapes() {
     new_ucmd!()
         .args(&["hello %b", "\\tworld"])
         .succeeds()
@@ -109,7 +109,7 @@ fn sub_bstring_handle_escapes() {
 }
 
 #[test]
-fn sub_bstring_ignore_subs() {
+fn sub_b_string_ignore_subs() {
     new_ucmd!()
         .args(&["hello %b", "world %% %i"])
         .succeeds()
@@ -133,7 +133,7 @@ fn sub_num_int() {
 }
 
 #[test]
-fn sub_num_int_minwidth() {
+fn sub_num_int_min_width() {
     new_ucmd!()
         .args(&["twenty is %1i", "20"])
         .succeeds()
@@ -181,11 +181,11 @@ fn sub_num_int_hex_in_neg() {
 }
 
 #[test]
-fn sub_num_int_charconst_in() {
+fn sub_num_int_char_const_in() {
     new_ucmd!()
-        .args(&["ninetyseven is %i", "'a"])
+        .args(&["ninety seven is %i", "'a"])
         .succeeds()
-        .stdout_only("ninetyseven is 97");
+        .stdout_only("ninety seven is 97");
 }
 
 #[test]
@@ -229,11 +229,35 @@ fn sub_num_float() {
 }
 
 #[test]
+fn sub_num_float_e_round() {
+    new_ucmd!()
+        .args(&["%e", "99999999"])
+        .succeeds()
+        .stdout_only("1.000000e+08");
+}
+
+#[test]
+fn sub_num_float_e_no_round() {
+    new_ucmd!()
+        .args(&["%e", "99999994"])
+        .succeeds()
+        .stdout_only("9.999999e+07");
+}
+
+#[test]
 fn sub_num_float_round() {
     new_ucmd!()
         .args(&["two is %f", "1.9999995"])
         .succeeds()
         .stdout_only("two is 2.000000");
+}
+
+#[test]
+fn sub_num_float_round_nines_dec() {
+    new_ucmd!()
+        .args(&["%f", "0.99999999"])
+        .succeeds()
+        .stdout_only("1.000000");
 }
 
 #[test]
@@ -265,7 +289,7 @@ fn sub_num_dec_trunc() {
     new_ucmd!()
         .args(&["pi is ~ %g", "3.1415926535"])
         .succeeds()
-        .stdout_only("pi is ~ 3.141593");
+        .stdout_only("pi is ~ 3.14159");
 }
 
 #[cfg_attr(not(feature = "test_unimplemented"), ignore)]
@@ -287,7 +311,7 @@ fn sub_num_hex_float_upper() {
 }
 
 #[test]
-fn sub_minwidth() {
+fn sub_min_width() {
     new_ucmd!()
         .args(&["hello %7s", "world"])
         .succeeds()
@@ -295,7 +319,7 @@ fn sub_minwidth() {
 }
 
 #[test]
-fn sub_minwidth_negative() {
+fn sub_min_width_negative() {
     new_ucmd!()
         .args(&["hello %-7s", "world"])
         .succeeds()
@@ -327,7 +351,7 @@ fn sub_int_leading_zeroes() {
 }
 
 #[test]
-fn sub_int_leading_zeroes_prio() {
+fn sub_int_leading_zeroes_padded() {
     new_ucmd!()
         .args(&["%5.4i", "11"])
         .succeeds()
@@ -359,7 +383,7 @@ fn sub_float_no_octal_in() {
 }
 
 #[test]
-fn sub_any_asterisk_firstparam() {
+fn sub_any_asterisk_first_param() {
     new_ucmd!()
         .args(&["%*i", "3", "11", "4", "12"])
         .succeeds()
@@ -401,7 +425,7 @@ fn sub_any_asterisk_hex_arg() {
 #[test]
 fn sub_any_specifiers_no_params() {
     new_ucmd!()
-        .args(&["%ztlhLji", "3"])
+        .args(&["%ztlhLji", "3"]) //spell-checker:disable-line
         .succeeds()
         .stdout_only("3");
 }
@@ -409,7 +433,7 @@ fn sub_any_specifiers_no_params() {
 #[test]
 fn sub_any_specifiers_after_first_param() {
     new_ucmd!()
-        .args(&["%0ztlhLji", "3"])
+        .args(&["%0ztlhLji", "3"]) //spell-checker:disable-line
         .succeeds()
         .stdout_only("3");
 }
@@ -417,7 +441,7 @@ fn sub_any_specifiers_after_first_param() {
 #[test]
 fn sub_any_specifiers_after_period() {
     new_ucmd!()
-        .args(&["%0.ztlhLji", "3"])
+        .args(&["%0.ztlhLji", "3"]) //spell-checker:disable-line
         .succeeds()
         .stdout_only("3");
 }
@@ -425,7 +449,76 @@ fn sub_any_specifiers_after_period() {
 #[test]
 fn sub_any_specifiers_after_second_param() {
     new_ucmd!()
-        .args(&["%0.0ztlhLji", "3"])
+        .args(&["%0.0ztlhLji", "3"]) //spell-checker:disable-line
         .succeeds()
         .stdout_only("3");
+}
+
+#[test]
+fn stop_after_additional_escape() {
+    new_ucmd!()
+        .args(&["A%sC\\cD%sF", "B", "E"]) //spell-checker:disable-line
+        .succeeds()
+        .stdout_only("ABC");
+}
+
+#[test]
+fn sub_float_leading_zeroes() {
+    new_ucmd!()
+        .args(&["%010f", "1"])
+        .succeeds()
+        .stdout_only("001.000000");
+}
+
+#[test]
+fn sub_general_float() {
+    new_ucmd!()
+        .args(&["%g", "1.1"])
+        .succeeds()
+        .stdout_only("1.1");
+}
+
+#[test]
+fn sub_general_truncate_to_integer() {
+    new_ucmd!().args(&["%g", "1.0"]).succeeds().stdout_only("1");
+}
+
+#[test]
+fn sub_general_scientific_notation() {
+    new_ucmd!()
+        .args(&["%g", "1000010"])
+        .succeeds()
+        .stdout_only("1.00001e+06");
+}
+
+#[test]
+fn sub_general_round_scientific_notation() {
+    new_ucmd!()
+        .args(&["%g", "123456789"])
+        .succeeds()
+        .stdout_only("1.23457e+08");
+}
+
+#[test]
+fn sub_general_round_float() {
+    new_ucmd!()
+        .args(&["%g", "12345.6789"])
+        .succeeds()
+        .stdout_only("12345.7");
+}
+
+#[test]
+fn sub_general_round_float_to_integer() {
+    new_ucmd!()
+        .args(&["%g", "123456.7"])
+        .succeeds()
+        .stdout_only("123457");
+}
+
+#[test]
+fn sub_general_round_float_leading_zeroes() {
+    new_ucmd!()
+        .args(&["%g", "1.000009"])
+        .succeeds()
+        .stdout_only("1.00001");
 }

@@ -7,29 +7,38 @@
 
 // spell-checker:ignore (ToDO) delim mkdelim
 
-#[macro_use]
-extern crate uucore;
-
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, stdin, BufRead, BufReader, Stdin};
 use std::path::Path;
+use uucore::error::FromIo;
+use uucore::error::UResult;
+use uucore::{format_usage, InvalidEncodingHandling};
 
-static SYNTAX: &str = "[OPTIONS] FILE1 FILE2";
-static SUMMARY: &str = "Compare sorted files line by line";
+use clap::{crate_version, Arg, ArgMatches, Command};
+
+static ABOUT: &str = "compare two sorted files line by line";
 static LONG_HELP: &str = "";
+const USAGE: &str = "{} [OPTION]... FILE1 FILE2";
 
-fn mkdelim(col: usize, opts: &getopts::Matches) -> String {
+mod options {
+    pub const COLUMN_1: &str = "1";
+    pub const COLUMN_2: &str = "2";
+    pub const COLUMN_3: &str = "3";
+    pub const DELIMITER: &str = "output-delimiter";
+    pub const DELIMITER_DEFAULT: &str = "\t";
+    pub const FILE_1: &str = "FILE1";
+    pub const FILE_2: &str = "FILE2";
+}
+
+fn mkdelim(col: usize, opts: &ArgMatches) -> String {
     let mut s = String::new();
-    let delim = match opts.opt_str("output-delimiter") {
-        Some(d) => d,
-        None => "\t".to_owned(),
-    };
+    let delim = opts.value_of(options::DELIMITER).unwrap();
 
-    if col > 1 && !opts.opt_present("1") {
+    if col > 1 && !opts.is_present(options::COLUMN_1) {
         s.push_str(delim.as_ref());
     }
-    if col > 2 && !opts.opt_present("2") {
+    if col > 2 && !opts.is_present(options::COLUMN_2) {
         s.push_str(delim.as_ref());
     }
 
@@ -37,9 +46,8 @@ fn mkdelim(col: usize, opts: &getopts::Matches) -> String {
 }
 
 fn ensure_nl(line: &mut String) {
-    match line.chars().last() {
-        Some('\n') => (),
-        _ => line.push('\n'),
+    if !line.ends_with('\n') {
+        line.push('\n');
     }
 }
 
@@ -57,7 +65,7 @@ impl LineReader {
     }
 }
 
-fn comm(a: &mut LineReader, b: &mut LineReader, opts: &getopts::Matches) {
+fn comm(a: &mut LineReader, b: &mut LineReader, opts: &ArgMatches) {
     let delim: Vec<String> = (0..4).map(|col| mkdelim(col, opts)).collect();
 
     let ra = &mut String::new();
@@ -80,7 +88,7 @@ fn comm(a: &mut LineReader, b: &mut LineReader, opts: &getopts::Matches) {
 
         match ord {
             Ordering::Less => {
-                if !opts.opt_present("1") {
+                if !opts.is_present(options::COLUMN_1) {
                     ensure_nl(ra);
                     print!("{}{}", delim[1], ra);
                 }
@@ -88,7 +96,7 @@ fn comm(a: &mut LineReader, b: &mut LineReader, opts: &getopts::Matches) {
                 na = a.read_line(ra);
             }
             Ordering::Greater => {
-                if !opts.opt_present("2") {
+                if !opts.is_present(options::COLUMN_2) {
                     ensure_nl(rb);
                     print!("{}{}", delim[2], rb);
                 }
@@ -96,7 +104,7 @@ fn comm(a: &mut LineReader, b: &mut LineReader, opts: &getopts::Matches) {
                 nb = b.read_line(rb);
             }
             Ordering::Equal => {
-                if !opts.opt_present("3") {
+                if !opts.is_present(options::COLUMN_3) {
                     ensure_nl(ra);
                     print!("{}{}", delim[3], ra);
                 }
@@ -119,24 +127,52 @@ fn open_file(name: &str) -> io::Result<LineReader> {
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
 
-    let matches = app!(SYNTAX, SUMMARY, LONG_HELP)
-        .optflag("1", "", "suppress column 1 (lines uniq to FILE1)")
-        .optflag("2", "", "suppress column 2 (lines uniq to FILE2)")
-        .optflag(
-            "3",
-            "",
-            "suppress column 3 (lines that appear in both files)",
-        )
-        .optopt("", "output-delimiter", "separate columns with STR", "STR")
-        .parse(args);
-
-    let mut f1 = open_file(matches.free[0].as_ref()).unwrap();
-    let mut f2 = open_file(matches.free[1].as_ref()).unwrap();
+    let matches = uu_app().get_matches_from(args);
+    let filename1 = matches.value_of(options::FILE_1).unwrap();
+    let filename2 = matches.value_of(options::FILE_2).unwrap();
+    let mut f1 = open_file(filename1).map_err_context(|| filename1.to_string())?;
+    let mut f2 = open_file(filename2).map_err_context(|| filename2.to_string())?;
 
     comm(&mut f1, &mut f2, &matches);
+    Ok(())
+}
 
-    0
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .version(crate_version!())
+        .about(ABOUT)
+        .after_help(LONG_HELP)
+        .override_usage(format_usage(USAGE))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::COLUMN_1)
+                .short('1')
+                .help("suppress column 1 (lines unique to FILE1)"),
+        )
+        .arg(
+            Arg::new(options::COLUMN_2)
+                .short('2')
+                .help("suppress column 2 (lines unique to FILE2)"),
+        )
+        .arg(
+            Arg::new(options::COLUMN_3)
+                .short('3')
+                .help("suppress column 3 (lines that appear in both files)"),
+        )
+        .arg(
+            Arg::new(options::DELIMITER)
+                .long(options::DELIMITER)
+                .help("separate columns with STR")
+                .value_name("STR")
+                .default_value(options::DELIMITER_DEFAULT)
+                .hide_default_value(true),
+        )
+        .arg(Arg::new(options::FILE_1).required(true))
+        .arg(Arg::new(options::FILE_2).required(true))
 }

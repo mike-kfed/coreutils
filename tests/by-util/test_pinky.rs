@@ -1,3 +1,8 @@
+//  * This file is part of the uutils coreutils package.
+//  *
+//  * For the full copyright and license information, please view the LICENSE
+//  * file that was distributed with this source code.
+
 extern crate uucore;
 
 use crate::common::util::*;
@@ -9,75 +14,98 @@ pub use self::pinky::*;
 
 #[test]
 fn test_capitalize() {
-    assert_eq!("Zbnmasd", "zbnmasd".capitalize());
-    assert_eq!("Abnmasd", "Abnmasd".capitalize());
-    assert_eq!("1masd", "1masd".capitalize());
+    assert_eq!("Zbnmasd", "zbnmasd".capitalize()); // spell-checker:disable-line
+    assert_eq!("Abnmasd", "Abnmasd".capitalize()); // spell-checker:disable-line
+    assert_eq!("1masd", "1masd".capitalize()); // spell-checker:disable-line
     assert_eq!("", "".capitalize());
 }
 
 #[test]
 fn test_long_format() {
-    let ulogin = "root";
-    let pw: Passwd = Passwd::locate(ulogin).unwrap();
-    let real_name = pw.user_info().replace("&", &pw.name().capitalize());
-    new_ucmd!().arg("-l").arg(ulogin).run().stdout_is(format!(
+    let login = "root";
+    let pw: Passwd = Passwd::locate(login).unwrap();
+    let user_info = pw.user_info.unwrap_or_default();
+    let user_dir = pw.user_dir.unwrap_or_default();
+    let user_shell = pw.user_shell.unwrap_or_default();
+    let real_name = user_info.replace('&', &pw.name.capitalize());
+    let ts = TestScenario::new(util_name!());
+    ts.ucmd().arg("-l").arg(login).succeeds().stdout_is(format!(
         "Login name: {:<28}In real life:  {}\nDirectory: {:<29}Shell:  {}\n\n",
-        ulogin,
-        real_name,
-        pw.user_dir(),
-        pw.user_shell()
+        login, real_name, user_dir, user_shell
     ));
 
-    new_ucmd!().arg("-lb").arg(ulogin).run().stdout_is(format!(
-        "Login name: {:<28}In real life:  {1}\n\n",
-        ulogin, real_name
-    ));
+    ts.ucmd()
+        .arg("-lb")
+        .arg(login)
+        .succeeds()
+        .stdout_is(format!(
+            "Login name: {:<28}In real life:  {1}\n\n",
+            login, real_name
+        ));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+#[test]
+fn test_long_format_multiple_users() {
+    // multiple instances of one account we know exists,
+    // the account of the test runner,
+    // and an account that (probably) doesn't exist
+    let runner = match std::env::var("USER") {
+        Ok(user) => user,
+        Err(_) => "".to_string(),
+    };
+    let args = ["-l", "root", "root", "root", &runner, "no_such_user"];
+    let ts = TestScenario::new(util_name!());
+    let expect = unwrap_or_return!(expected_result(&ts, &args));
+
+    ts.ucmd()
+        .args(&args)
+        .succeeds()
+        .stdout_is(expect.stdout_str())
+        .stderr_is(expect.stderr_str());
+}
+
+#[test]
+fn test_long_format_wo_user() {
+    // "no username specified; at least one must be specified when using -l"
+    new_ucmd!().arg("-l").fails();
+}
+
+#[cfg(unix)]
 #[test]
 fn test_short_format_i() {
     // allow whitespace variation
     // * minor whitespace differences occur between platform built-in outputs; specifically, the number of trailing TABs may be variant
     let args = ["-i"];
-    let actual = TestScenario::new(util_name!())
-        .ucmd()
-        .args(&args)
-        .run()
-        .stdout;
-    let expect = expected_result(&args);
-    println!("actual: {:?}", actual);
-    println!("expect: {:?}", expect);
+    let ts = TestScenario::new(util_name!());
+    let actual = ts.ucmd().args(&args).succeeds().stdout_move_str();
+    let expect = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
     let v_actual: Vec<&str> = actual.split_whitespace().collect();
     let v_expect: Vec<&str> = expect.split_whitespace().collect();
     assert_eq!(v_actual, v_expect);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn test_short_format_q() {
     // allow whitespace variation
     // * minor whitespace differences occur between platform built-in outputs; specifically, the number of trailing TABs may be variant
     let args = ["-q"];
-    let actual = TestScenario::new(util_name!())
-        .ucmd()
-        .args(&args)
-        .run()
-        .stdout;
-    let expect = expected_result(&args);
-    println!("actual: {:?}", actual);
-    println!("expect: {:?}", expect);
+    let ts = TestScenario::new(util_name!());
+    let actual = ts.ucmd().args(&args).succeeds().stdout_move_str();
+    let expect = unwrap_or_return!(expected_result(&ts, &args)).stdout_move_str();
     let v_actual: Vec<&str> = actual.split_whitespace().collect();
     let v_expect: Vec<&str> = expect.split_whitespace().collect();
     assert_eq!(v_actual, v_expect);
 }
 
-#[cfg(target_os = "linux")]
-fn expected_result(args: &[&str]) -> String {
-    TestScenario::new(util_name!())
-        .cmd_keepenv(util_name!())
-        .env("LANGUAGE", "C")
-        .args(args)
-        .run()
-        .stdout
+#[cfg(unix)]
+#[test]
+fn test_no_flag() {
+    let ts = TestScenario::new(util_name!());
+    let actual = ts.ucmd().succeeds().stdout_move_str();
+    let expect = unwrap_or_return!(expected_result(&ts, &[])).stdout_move_str();
+    let v_actual: Vec<&str> = actual.split_whitespace().collect();
+    let v_expect: Vec<&str> = expect.split_whitespace().collect();
+    assert_eq!(v_actual, v_expect);
 }

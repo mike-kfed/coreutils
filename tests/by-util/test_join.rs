@@ -1,4 +1,12 @@
+// spell-checker:ignore (words) autoformat nocheck
+
 use crate::common::util::*;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+#[cfg(windows)]
+use std::{ffi::OsString, os::windows::ffi::OsStringExt};
 
 #[test]
 fn empty_files() {
@@ -74,6 +82,27 @@ fn different_field() {
 }
 
 #[test]
+fn out_of_bounds_fields() {
+    new_ucmd!()
+        .arg("fields_1.txt")
+        .arg("fields_4.txt")
+        .arg("-1")
+        .arg("3")
+        .arg("-2")
+        .arg("5")
+        .succeeds()
+        .stdout_only_fixture("out_of_bounds_fields.expected");
+
+    new_ucmd!()
+        .arg("fields_1.txt")
+        .arg("fields_4.txt")
+        .arg("-j")
+        .arg("100000000000000000000") // > usize::MAX for 64 bits
+        .succeeds()
+        .stdout_only_fixture("out_of_bounds_fields.expected");
+}
+
+#[test]
 fn unpaired_lines() {
     new_ucmd!()
         .arg("fields_2.txt")
@@ -92,6 +121,18 @@ fn unpaired_lines() {
         .arg("2")
         .succeeds()
         .stdout_only_fixture("unpaired_lines.expected");
+
+    new_ucmd!()
+        .arg("fields_3.txt")
+        .arg("fields_2.txt")
+        .arg("-1")
+        .arg("2")
+        .arg("-a")
+        .arg("1")
+        .arg("-a")
+        .arg("2")
+        .succeeds()
+        .stdout_only_fixture("unpaired_lines_outer.expected");
 }
 
 #[test]
@@ -105,6 +146,18 @@ fn suppress_joined() {
         .arg("2")
         .succeeds()
         .stdout_only_fixture("suppress_joined.expected");
+
+    new_ucmd!()
+        .arg("fields_3.txt")
+        .arg("fields_2.txt")
+        .arg("-1")
+        .arg("2")
+        .arg("-a")
+        .arg("1")
+        .arg("-v")
+        .arg("2")
+        .succeeds()
+        .stdout_only_fixture("suppress_joined_outer.expected");
 }
 
 #[test]
@@ -141,14 +194,14 @@ fn new_line_separated() {
 }
 
 #[test]
-fn multitab_character() {
+fn tab_multi_character() {
     new_ucmd!()
         .arg("semicolon_fields_1.txt")
         .arg("semicolon_fields_2.txt")
         .arg("-t")
         .arg("э")
         .fails()
-        .stderr_is("join: error: multi-character tab э");
+        .stderr_is("join: multi-character tab э");
 }
 
 #[test]
@@ -201,6 +254,19 @@ fn autoformat() {
         .pipe_in("1 x y z\n2 p")
         .succeeds()
         .stdout_only("1 x y z a\n2 p   b\n");
+
+    new_ucmd!()
+        .arg("-")
+        .arg("fields_2.txt")
+        .arg("-a")
+        .arg("1")
+        .arg("-o")
+        .arg("auto")
+        .arg("-e")
+        .arg(".")
+        .pipe_in("1 x y z\n2 p\n99 a b\n")
+        .succeeds()
+        .stdout_only("1 x y z a\n2 p . . b\n99 a b . .\n");
 }
 
 #[test]
@@ -211,7 +277,7 @@ fn empty_format() {
         .arg("-o")
         .arg("")
         .fails()
-        .stderr_is("join: error: invalid file number in field spec: ''");
+        .stderr_is("join: invalid file number in field spec: ''");
 }
 
 #[test]
@@ -243,12 +309,65 @@ fn missing_format_fields() {
 }
 
 #[test]
+fn nocheck_order() {
+    new_ucmd!()
+        .arg("fields_1.txt")
+        .arg("fields_2.txt")
+        .arg("--nocheck-order")
+        .succeeds()
+        .stdout_only_fixture("default.expected");
+}
+
+#[test]
 fn wrong_line_order() {
+    let ts = TestScenario::new(util_name!());
     new_ucmd!()
         .arg("fields_2.txt")
         .arg("fields_4.txt")
         .fails()
-        .stderr_is("fields_4.txt:5: is not sorted");
+        .stdout_contains("7 g f 4 fg")
+        .stderr_is(&format!(
+            "{0} {1}: fields_4.txt:5: is not sorted: 11 g 5 gh\n{0} {1}: input is not in sorted order",
+            ts.bin_path.to_string_lossy(),
+            ts.util_name
+        ));
+
+    new_ucmd!()
+        .arg("--check-order")
+        .arg("fields_2.txt")
+        .arg("fields_4.txt")
+        .fails()
+        .stdout_does_not_contain("7 g f 4 fg")
+        .stderr_is(&format!(
+            "{0}: fields_4.txt:5: is not sorted: 11 g 5 gh",
+            ts.util_name
+        ));
+}
+
+#[test]
+fn both_files_wrong_line_order() {
+    let ts = TestScenario::new(util_name!());
+    new_ucmd!()
+        .arg("fields_4.txt")
+        .arg("fields_5.txt")
+        .fails()
+        .stdout_contains("5 e 3 ef")
+        .stderr_is(&format!(
+            "{0} {1}: fields_5.txt:4: is not sorted: 3\n{0} {1}: fields_4.txt:5: is not sorted: 11 g 5 gh\n{0} {1}: input is not in sorted order",
+            ts.bin_path.to_string_lossy(),
+            ts.util_name
+        ));
+
+    new_ucmd!()
+        .arg("--check-order")
+        .arg("fields_4.txt")
+        .arg("fields_5.txt")
+        .fails()
+        .stdout_does_not_contain("5 e 3 ef")
+        .stderr_is(&format!(
+            "{0}: fields_5.txt:4: is not sorted: 3",
+            ts.util_name
+        ));
 }
 
 #[test]
@@ -288,4 +407,81 @@ fn single_file_with_header() {
         .arg("--header")
         .succeeds()
         .stdout_is("A 1\n");
+}
+
+#[test]
+fn non_line_feeds() {
+    new_ucmd!()
+        .arg("non-line_feeds_1.txt")
+        .arg("non-line_feeds_2.txt")
+        .succeeds()
+        .stdout_only_fixture("non-line_feeds.expected");
+}
+
+#[test]
+fn non_unicode() {
+    new_ucmd!()
+        .arg("non-unicode_1.bin")
+        .arg("non-unicode_2.bin")
+        .succeeds()
+        .stdout_only_fixture("non-unicode.expected");
+
+    #[cfg(unix)]
+    {
+        let invalid_utf8: u8 = 167;
+        new_ucmd!()
+            .arg("-t")
+            .arg(OsStr::from_bytes(&[invalid_utf8]))
+            .arg("non-unicode_1.bin")
+            .arg("non-unicode_2.bin")
+            .succeeds()
+            .stdout_only_fixture("non-unicode_sep.expected");
+    }
+
+    #[cfg(windows)]
+    {
+        let invalid_utf16: OsString = OsStringExt::from_wide(&[0xD800]);
+        new_ucmd!()
+            .arg("-t")
+            .arg(&invalid_utf16)
+            .arg("non-unicode_1.bin")
+            .arg("non-unicode_2.bin")
+            .fails()
+            .stderr_is(
+                "join: unprintable field separators are only supported on unix-like platforms",
+            );
+    }
+}
+
+#[test]
+fn null_field_separators() {
+    new_ucmd!()
+        .arg("-t")
+        .arg("\\0")
+        .arg("non-unicode_1.bin")
+        .arg("non-unicode_2.bin")
+        .succeeds()
+        .stdout_only_fixture("null-sep.expected");
+}
+
+#[test]
+fn null_line_endings() {
+    new_ucmd!()
+        .arg("-z")
+        .arg("non-unicode_1.bin")
+        .arg("non-unicode_2.bin")
+        .succeeds()
+        .stdout_only_fixture("z.expected");
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+fn test_full() {
+    let dev_full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+    new_ucmd!()
+        .arg("fields_1.txt")
+        .arg("fields_2.txt")
+        .set_stdout(dev_full)
+        .fails()
+        .stderr_contains("No space left on device");
 }

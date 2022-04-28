@@ -54,17 +54,17 @@ impl FailingMockStream {
     ///
     /// When `read` or `write` is called, it will return an error `repeat_count` times.
     /// `kind` and `message` can be specified to define the exact error.
-    pub fn new(kind: ErrorKind, message: &'static str, repeat_count: i32) -> FailingMockStream {
-        FailingMockStream {
-            kind: kind,
-            message: message,
-            repeat_count: repeat_count,
+    pub fn new(kind: ErrorKind, message: &'static str, repeat_count: i32) -> Self {
+        Self {
+            kind,
+            message,
+            repeat_count,
         }
     }
 
     fn error(&mut self) -> Result<usize> {
         if self.repeat_count == 0 {
-            return Ok(0);
+            Ok(0)
         } else {
             if self.repeat_count > 0 {
                 self.repeat_count -= 1;

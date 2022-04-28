@@ -1,1 +1,1 @@
-uucore_procs::main!(uu_cksum); // spell-checker:ignore procs uucore
+uucore::bin!(uu_cksum);

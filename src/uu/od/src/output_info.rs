@@ -54,7 +54,7 @@ impl OutputInfo {
         line_bytes: usize,
         formats: &[ParsedFormatterItemInfo],
         output_duplicates: bool,
-    ) -> OutputInfo {
+    ) -> Self {
         let byte_size_block = formats.iter().fold(1, |max, next| {
             cmp::max(max, next.formatter_item_info.byte_size)
         });
@@ -68,9 +68,9 @@ impl OutputInfo {
         let print_width_line = print_width_block * (line_bytes / byte_size_block);
 
         let spaced_formatters =
-            OutputInfo::create_spaced_formatter_info(&formats, byte_size_block, print_width_block);
+            Self::create_spaced_formatter_info(formats, byte_size_block, print_width_block);
 
-        OutputInfo {
+        Self {
             byte_size_line: line_bytes,
             print_width_line,
             byte_size_block,
@@ -90,7 +90,7 @@ impl OutputInfo {
             .map(|f| SpacedFormatterItemInfo {
                 formatter_item_info: f.formatter_item_info,
                 add_ascii_dump: f.add_ascii_dump,
-                spacing: OutputInfo::calculate_alignment(f, byte_size_block, print_width_block),
+                spacing: Self::calculate_alignment(f, byte_size_block, print_width_block),
             })
             .collect()
     }
@@ -145,13 +145,12 @@ impl OutputInfo {
         byte_size_block: usize,
         print_width_block: usize,
     ) -> [usize; MAX_BYTES_PER_UNIT] {
-        if byte_size_block > MAX_BYTES_PER_UNIT {
-            panic!(
-                "{}-bits types are unsupported. Current max={}-bits.",
-                8 * byte_size_block,
-                8 * MAX_BYTES_PER_UNIT
-            );
-        }
+        assert!(
+            byte_size_block <= MAX_BYTES_PER_UNIT,
+            "{}-bits types are unsupported. Current max={}-bits.",
+            8 * byte_size_block,
+            8 * MAX_BYTES_PER_UNIT
+        );
         let mut spacing = [0; MAX_BYTES_PER_UNIT];
 
         let mut byte_size = sf.byte_size();

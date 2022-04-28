@@ -9,6 +9,8 @@
 
 use std::str::FromStr;
 
+use crate::display::Quotable;
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Range {
     pub low: usize,
@@ -18,7 +20,7 @@ pub struct Range {
 impl FromStr for Range {
     type Err = &'static str;
 
-    fn from_str(s: &str) -> Result<Range, &'static str> {
+    fn from_str(s: &str) -> Result<Self, &'static str> {
         use std::usize::MAX;
 
         let mut parts = s.splitn(2, '-');
@@ -31,7 +33,7 @@ impl FromStr for Range {
             (Some(nm), None) => {
                 if let Ok(nm) = nm.parse::<usize>() {
                     if nm > 0 {
-                        Ok(Range { low: nm, high: nm })
+                        Ok(Self { low: nm, high: nm })
                     } else {
                         Err(field)
                     }
@@ -42,7 +44,7 @@ impl FromStr for Range {
             (Some(n), Some(m)) if m.is_empty() => {
                 if let Ok(low) = n.parse::<usize>() {
                     if low > 0 {
-                        Ok(Range { low, high: MAX - 1 })
+                        Ok(Self { low, high: MAX - 1 })
                     } else {
                         Err(field)
                     }
@@ -53,7 +55,7 @@ impl FromStr for Range {
             (Some(n), Some(m)) if n.is_empty() => {
                 if let Ok(high) = m.parse::<usize>() {
                     if high > 0 {
-                        Ok(Range { low: 1, high })
+                        Ok(Self { low: 1, high })
                     } else {
                         Err(field)
                     }
@@ -64,7 +66,7 @@ impl FromStr for Range {
             (Some(n), Some(m)) => match (n.parse::<usize>(), m.parse::<usize>()) {
                 (Ok(low), Ok(high)) => {
                     if low > 0 && low <= high {
-                        Ok(Range { low, high })
+                        Ok(Self { low, high })
                     } else if low == 0 {
                         Err(field)
                     } else {
@@ -79,16 +81,15 @@ impl FromStr for Range {
 }
 
 impl Range {
-    pub fn from_list(list: &str) -> Result<Vec<Range>, String> {
+    pub fn from_list(list: &str) -> Result<Vec<Self>, String> {
         use std::cmp::max;
 
-        let mut ranges: Vec<Range> = vec![];
+        let mut ranges: Vec<Self> = vec![];
 
         for item in list.split(',') {
-            match FromStr::from_str(item) {
-                Ok(range_item) => ranges.push(range_item),
-                Err(e) => return Err(format!("range '{}' was invalid: {}", item, e)),
-            }
+            let range_item = FromStr::from_str(item)
+                .map_err(|e| format!("range {} was invalid: {}", item.quote(), e))?;
+            ranges.push(range_item);
         }
 
         ranges.sort();

@@ -10,12 +10,18 @@
 #[macro_use]
 extern crate uucore;
 
+use clap::{crate_version, Arg, Command};
 use std::fs::File;
-use std::io::{stdin, Read, Result};
+use std::io::{stdin, Read};
 use std::path::Path;
+use uucore::display::Quotable;
+use uucore::error::{FromIo, UResult, USimpleError};
+use uucore::{format_usage, InvalidEncodingHandling};
 
 static NAME: &str = "sum";
-static VERSION: &str = env!("CARGO_PKG_VERSION");
+static USAGE: &str = "{} [OPTION]... [FILE]...";
+static SUMMARY: &str = "Checksum and count the blocks in a file.\n\
+                        With no FILE, or when  FILE is -, read standard input.";
 
 fn bsd_sum(mut reader: Box<dyn Read>) -> (usize, u16) {
     let mut buf = [0; 1024];
@@ -60,59 +66,50 @@ fn sysv_sum(mut reader: Box<dyn Read>) -> (usize, u16) {
     (blocks_read, ret as u16)
 }
 
-fn open(name: &str) -> Result<Box<dyn Read>> {
+fn open(name: &str) -> UResult<Box<dyn Read>> {
     match name {
         "-" => Ok(Box::new(stdin()) as Box<dyn Read>),
         _ => {
-            let f = File::open(&Path::new(name))?;
+            let path = &Path::new(name);
+            if path.is_dir() {
+                return Err(USimpleError::new(
+                    2,
+                    format!("{}: Is a directory", name.maybe_quote()),
+                ));
+            };
+            // Silent the warning as we want to the error message
+            if path.metadata().is_err() {
+                return Err(USimpleError::new(
+                    2,
+                    format!("{}: No such file or directory", name.maybe_quote()),
+                ));
+            };
+            let f = File::open(path).map_err_context(String::new)?;
             Ok(Box::new(f) as Box<dyn Read>)
         }
     }
 }
 
-pub fn uumain(args: impl uucore::Args) -> i32 {
-    let args = args.collect_str();
+mod options {
+    pub static FILE: &str = "file";
+    pub static BSD_COMPATIBLE: &str = "r";
+    pub static SYSTEM_V_COMPATIBLE: &str = "sysv";
+}
 
-    let mut opts = getopts::Options::new();
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    let args = args
+        .collect_str(InvalidEncodingHandling::ConvertLossy)
+        .accept_any();
 
-    opts.optflag("r", "", "use the BSD compatible algorithm (default)");
-    opts.optflag("s", "sysv", "use System V compatible algorithm");
-    opts.optflag("h", "help", "show this help message");
-    opts.optflag("v", "version", "print the version and exit");
+    let matches = uu_app().get_matches_from(args);
 
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => crash!(1, "Invalid options\n{}", f),
+    let files: Vec<String> = match matches.values_of(options::FILE) {
+        Some(v) => v.clone().map(|v| v.to_owned()).collect(),
+        None => vec!["-".to_owned()],
     };
 
-    if matches.opt_present("help") {
-        let msg = format!(
-            "{0} {1}
-
-Usage:
-  {0} [OPTION]... [FILE]...
-
-Checksum and count the blocks in a file.",
-            NAME, VERSION
-        );
-        println!(
-            "{}\nWith no FILE, or when  FILE is -, read standard input.",
-            opts.usage(&msg)
-        );
-        return 0;
-    }
-    if matches.opt_present("version") {
-        println!("{} {}", NAME, VERSION);
-        return 0;
-    }
-
-    let sysv = matches.opt_present("sysv");
-
-    let files = if matches.free.is_empty() {
-        vec!["-".to_owned()]
-    } else {
-        matches.free
-    };
+    let sysv = matches.is_present(options::SYSTEM_V_COMPATIBLE);
 
     let print_names = if sysv {
         files.len() > 1 || files[0] != "-"
@@ -123,7 +120,10 @@ Checksum and count the blocks in a file.",
     for file in &files {
         let reader = match open(file) {
             Ok(f) => f,
-            _ => crash!(1, "unable to open file"),
+            Err(error) => {
+                show!(error);
+                continue;
+            }
         };
         let (blocks, sum) = if sysv {
             sysv_sum(reader)
@@ -137,6 +137,30 @@ Checksum and count the blocks in a file.",
             println!("{} {}", sum, blocks);
         }
     }
+    Ok(())
+}
 
-    0
+pub fn uu_app<'a>() -> Command<'a> {
+    Command::new(uucore::util_name())
+        .name(NAME)
+        .version(crate_version!())
+        .override_usage(format_usage(USAGE))
+        .about(SUMMARY)
+        .infer_long_args(true)
+        .arg(
+            Arg::new(options::FILE)
+                .multiple_occurrences(true)
+                .hide(true),
+        )
+        .arg(
+            Arg::new(options::BSD_COMPATIBLE)
+                .short('r')
+                .help("use the BSD sum algorithm, use 1K blocks (default)"),
+        )
+        .arg(
+            Arg::new(options::SYSTEM_V_COMPATIBLE)
+                .short('s')
+                .long(options::SYSTEM_V_COMPATIBLE)
+                .help("use System V sum algorithm, use 512 bytes blocks"),
+        )
 }

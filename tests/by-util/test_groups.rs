@@ -1,46 +1,57 @@
+//  * This file is part of the uutils coreutils package.
+//  *
+//  * For the full copyright and license information, please view the LICENSE
+//  * file that was distributed with this source code.
+
+//spell-checker: ignore coreutil
+
 use crate::common::util::*;
 
+const VERSION_MIN_MULTIPLE_USERS: &str = "8.31"; // this feature was introduced in GNU's coreutils 8.31
+
 #[test]
+#[cfg(unix)]
 fn test_groups() {
-    let (_, mut ucmd) = at_and_ucmd!();
-    let result = ucmd.run();
-    println!("result.stdout {}", result.stdout);
-    println!("result.stderr = {}", result.stderr);
-    if is_ci() && result.stdout.trim().is_empty() {
-        // In the CI, some server are failing to return the group.
-        // As seems to be a configuration issue, ignoring it
-        return;
-    }
-    assert!(result.success);
-    assert!(!result.stdout.trim().is_empty());
+    let ts = TestScenario::new(util_name!());
+    let result = ts.ucmd().run();
+    let exp_result = unwrap_or_return!(expected_result(&ts, &[]));
+
+    result
+        .stdout_is(exp_result.stdout_str())
+        .stderr_is(exp_result.stderr_str())
+        .code_is(exp_result.code());
 }
 
 #[test]
-fn test_groups_arg() {
-    // get the username with the "id -un" command
-    let result = TestScenario::new("id").ucmd_keepenv().arg("-un").run();
-    println!("result.stdout {}", result.stdout);
-    println!("result.stderr = {}", result.stderr);
-    let s1 = String::from(result.stdout.trim());
-    if is_ci() && s1.parse::<f64>().is_ok() {
-        // In the CI, some server are failing to return id -un.
-        // So, if we are getting a uid, just skip this test
-        // As seems to be a configuration issue, ignoring it
-        return;
-    }
+#[cfg(unix)]
+fn test_groups_username() {
+    let test_users = [&whoami()[..]];
 
-    println!("result.stdout {}", result.stdout);
-    println!("result.stderr = {}", result.stderr);
-    assert!(result.success);
-    assert!(!result.stdout.is_empty());
-    let username = result.stdout.trim();
+    let ts = TestScenario::new(util_name!());
+    let result = ts.ucmd().args(&test_users).run();
+    let exp_result = unwrap_or_return!(expected_result(&ts, &test_users));
 
-    // call groups with the user name to check that we
-    // are getting something
-    let (_, mut ucmd) = at_and_ucmd!();
-    let result = ucmd.arg(username).run();
-    println!("result.stdout {}", result.stdout);
-    println!("result.stderr = {}", result.stderr);
-    assert!(result.success);
-    assert!(!result.stdout.is_empty());
+    result
+        .stdout_is(exp_result.stdout_str())
+        .stderr_is(exp_result.stderr_str())
+        .code_is(exp_result.code());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_groups_username_multiple() {
+    unwrap_or_return!(check_coreutil_version(
+        util_name!(),
+        VERSION_MIN_MULTIPLE_USERS
+    ));
+    let test_users = ["root", "man", "postfix", "sshd", &whoami()];
+
+    let ts = TestScenario::new(util_name!());
+    let result = ts.ucmd().args(&test_users).run();
+    let exp_result = unwrap_or_return!(expected_result(&ts, &test_users));
+
+    result
+        .stdout_is(exp_result.stdout_str())
+        .stderr_is(exp_result.stderr_str())
+        .code_is(exp_result.code());
 }
