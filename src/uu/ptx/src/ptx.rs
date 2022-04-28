@@ -176,7 +176,6 @@ impl WordFilter {
                 }
             }
         };
-        //dbg!(&reg);
         Ok(Self {
             only_specified: o,
             ignore_specified: i,
