@@ -88,12 +88,15 @@ fn read_word_filter_file(
     Ok(words)
 }
 
-fn read_char_filter_file(matches: &clap::ArgMatches, option: &str) -> HashSet<char> {
-    let filename = matches.opt_str(option).expect("parsing options failed!");
-    let mut reader = crash_if_err!(1, File::open(filename));
+fn read_char_filter_file(
+    matches: &clap::ArgMatches,
+    option: &str,
+) -> std::io::Result<HashSet<char>> {
+    let filename = matches.value_of(option).expect("parsing options failed!");
+    let mut reader = File::open(filename)?;
     let mut buffer = String::new();
-    crash_if_err!(1, reader.read_to_string(&mut buffer));
-    buffer.chars().collect()
+    reader.read_to_string(&mut buffer)?;
+    Ok(buffer.chars().collect())
 }
 
 #[derive(Debug)]
@@ -122,21 +125,23 @@ impl WordFilter {
             (false, HashSet::new())
         };
         // TODO
-        let break_set: Option<HashSet<char>> =
-            if matches.opt_present("b") && !matches.opt_present("W") {
-                let chars = read_char_filter_file(matches, "b");
-                let mut hs: HashSet<char> = if config.gnu_ext {
-                    HashSet::new() // really only chars found in file
-                } else {
-                    // GNU off means at least these are considered
-                    [' ', '\t', '\n'].iter().cloned().collect()
-                };
-                hs.extend(chars);
-                Some(hs)
+        let break_set: Option<HashSet<char>> = if matches.is_present(options::BREAK_FILE)
+            && !matches.is_present(options::WORD_REGEXP)
+        {
+            let chars =
+                read_char_filter_file(matches, options::BREAK_FILE).map_err_context(String::new)?;
+            let mut hs: HashSet<char> = if config.gnu_ext {
+                HashSet::new() // really only chars found in file
             } else {
-                // if -W takes precedence or default
-                None
+                // GNU off means at least these are considered
+                [' ', '\t', '\n'].iter().cloned().collect()
             };
+            hs.extend(chars);
+            Some(hs)
+        } else {
+            // if -W takes precedence or default
+            None
+        };
         // Ignore empty string regex from cmd-line-args
         let arg_reg: Option<String> = if matches.is_present(options::WORD_REGEXP) {
             match matches.value_of(options::WORD_REGEXP) {
